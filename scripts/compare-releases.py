@@ -405,6 +405,20 @@ def extract_changed_hunks(old_text, new_text, context_lines=5,
     return extract_changed_hunks_difflib(old_text, new_text, context_lines)
 
 
+def _is_all_dft_limit(hunks_text):
+    """Check if all difftastic hunks hit DFT_BYTE_LIMIT or DFT_GRAPH_LIMIT."""
+    if not hunks_text or not hunks_text.strip():
+        return False
+    # Match difftastic hunk headers (filename --- N/M --- Language lines)
+    pattern = re.compile(
+        r'^(\S.+\s---\s(?:\d+/\d+\s---\s)?[A-Z]\S*(?:\s\(.+\))?)$', re.MULTILINE
+    )
+    headers = pattern.findall(hunks_text)
+    if not headers:
+        return False
+    return all("exceeded DFT_" in h for h in headers)
+
+
 def _analyze_file_pair(old_path, new_path, rel_label, suffix):
     """Analyze a single old/new file pair for changes."""
     report = {
@@ -427,8 +441,13 @@ def _analyze_file_pair(old_path, new_path, rel_label, suffix):
 
             hunks = extract_changed_hunks(old_text, new_text,
                                           old_path=old_path, new_path=new_path)
-            if len(hunks) > 50000:
-                hunks = hunks[:50000] + "\n... [truncated, diff too large] ...\n"
+            # Detect DFT-limit-only difftastic output and fall back to difflib
+            used_difflib_fallback = False
+            if get_has_difft() and old_path and new_path and _is_all_dft_limit(hunks):
+                print(f"    {rel_label}: difftastic exceeded limits, falling back to difflib")
+                hunks = extract_changed_hunks_difflib(old_text, new_text, context_lines=5)
+                used_difflib_fallback = True
+            report["diff_engine"] = "difflib" if (used_difflib_fallback or not get_has_difft()) else "difftastic"
             report["hunks"] = hunks
         except Exception as e:
             report["hunks"] = f"Error analyzing: {e}"
@@ -438,8 +457,13 @@ def _analyze_file_pair(old_path, new_path, rel_label, suffix):
             new_text = new_path.read_text(errors="replace")
             hunks = extract_changed_hunks(old_text, new_text, context_lines=3,
                                           old_path=old_path, new_path=new_path)
-            if len(hunks) > 10000:
-                hunks = hunks[:10000] + "\n... [truncated] ...\n"
+            # Detect DFT-limit-only difftastic output and fall back to difflib
+            used_difflib_fallback = False
+            if get_has_difft() and old_path and new_path and _is_all_dft_limit(hunks):
+                print(f"    {rel_label}: difftastic exceeded limits, falling back to difflib")
+                hunks = extract_changed_hunks_difflib(old_text, new_text, context_lines=3)
+                used_difflib_fallback = True
+            report["diff_engine"] = "difflib" if (used_difflib_fallback or not get_has_difft()) else "difftastic"
             report["hunks"] = hunks
         except Exception:
             pass
@@ -510,9 +534,12 @@ def _render_file_report_md(fr, lines):
 
     hunks = fr.get("hunks", "")
     if hunks:
+        display_hunks = hunks
+        if len(hunks) > 50000:
+            display_hunks = hunks[:50000] + "\n... [truncated, diff too large] ...\n"
         lines.append("**Changed code hunks:**")
         lines.append("```diff")
-        lines.append(hunks.rstrip())
+        lines.append(display_hunks.rstrip())
         lines.append("```")
         lines.append("")
 
@@ -637,28 +664,53 @@ def is_build_noise_only(hunk_text, use_difft=False):
         re.compile(r'^["\']?[0-9a-f]{7,40}["\']?[,;]?$'),  # commit hashes
     ]
 
-    changed_lines = DIFF_CHANGE_LINE_RE.findall(hunk_text)
-    if not changed_lines:
-        return True
-
-    changes = []
+    # Separate added and removed lines
+    adds = []
+    removes = []
     for line in hunk_text.splitlines():
         if line.startswith("---") or line.startswith("+++"):
             continue
-        if line.startswith("+") or line.startswith("-"):
-            changes.append(line[1:].strip())
+        if line.startswith("+"):
+            adds.append(line[1:].strip())
+        elif line.startswith("-"):
+            removes.append(line[1:].strip())
 
-    if not changes:
+    changes = adds + removes
+    if not changes or all(not c for c in changes):
         return True
 
+    # Check 1: all changed lines match explicit noise patterns
+    all_pattern_noise = True
     for change in changes:
         if not change:
             continue
-        is_noise = any(p.match(change) for p in noise_patterns)
-        if not is_noise:
-            return False
+        if not any(p.match(change) for p in noise_patterns):
+            all_pattern_noise = False
+            break
+    if all_pattern_noise:
+        return True
 
-    return True
+    # Check 2: minified identifier renames.
+    # If every +/- line, after normalizing short identifiers, either
+    # matches a noise pattern or has a corresponding line on the other side,
+    # then the hunk is just minified name shuffling.
+    if adds and removes and len(adds) == len(removes):
+        is_rename_only = True
+        for a, r in zip(adds, removes):
+            if not a and not r:
+                continue
+            # If both match noise patterns individually, that's fine
+            if a and any(p.match(a) for p in noise_patterns) and \
+               r and any(p.match(r) for p in noise_patterns):
+                continue
+            # Normalize minified names and compare
+            if _normalize_minified_names(a) != _normalize_minified_names(r):
+                is_rename_only = False
+                break
+        if is_rename_only:
+            return True
+
+    return False
 
 
 def split_hunks(hunks_text, use_difft):
@@ -732,14 +784,33 @@ STRING_NOISE_PATTERNS = [
 
 
 def _normalize_minified_names(s):
-    """Normalize short minified identifiers to detect renames.
+    """Normalize minified identifiers to detect renames.
 
-    Replaces standalone 1-2 letter identifiers with '_' so that strings
-    differing only by minified variable names compare as equal.
-    This catches patterns like 'v' vs 'b', 'ba' vs 'va', 'bt' vs 'vt'.
+    Replaces short identifiers with '_' so that strings differing only by
+    minified variable names compare as equal.
+
+    Handles patterns like:
+    - 1-3 letter names: v, ba, iPe, AEe
+    - $-prefixed: $2e, $$
+    - _-prefixed short names: _O, _2, _sentryDebugIds
+    - Capitalized short suffixes: vt, Bt (used in minified class/function names)
+    - IPC namespace UUIDs embedded in strings: $eipc_message$_UUID_$_...
     """
-    # Replace standalone 1-2 letter identifiers (word boundaries)
-    return re.sub(r'\b[a-zA-Z]{1,2}\b', '_', s)
+    # Step 1: Normalize UUIDs (must run before $ and hex hash normalization)
+    s = re.sub(
+        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+        'UUID', s
+    )
+    # Step 2: Normalize embedded hex hashes (commit SHAs, content hashes)
+    s = re.sub(r'["\']?[0-9a-f]{7,64}["\']?', 'HASH', s)
+    # Step 3: Replace $-prefixed short identifiers ($2e, $$, $t)
+    s = re.sub(r'\$[a-zA-Z0-9]{0,2}\b', '_', s)
+    # Step 4: Replace _-prefixed short identifiers (_O, _2, _e)
+    s = re.sub(r'\b_[a-zA-Z0-9]{0,2}\b', '_', s)
+    # Step 5: Replace minified identifiers — short alphanumeric names
+    # Catches: v, ba, iPe, AEe, u4e, f4e, qMe, HMe, X_, ab, cn, etc.
+    s = re.sub(r'\b[a-zA-Z]{1,3}[0-9]*[a-zA-Z_]?\b', '_', s)
+    return s
 
 
 def are_string_changes_noise_only(new_strings, removed_strings):
@@ -944,8 +1015,64 @@ Return your analysis as JSON."""
         return {"error": f"Unexpected error: {e}", **error_stub}
 
 
+def _build_file_analysis_text(hunks, include_code=True):
+    """Build analysis text for a list of hunk results."""
+    text = ""
+    for i, hunk in enumerate(hunks):
+        if "error" in hunk and hunk["error"]:
+            text += f"\n### Hunk {i + 1} (analysis failed: {hunk['error']})\n"
+            continue
+        text += f"\n### Hunk {i + 1}\n"
+        text += f"**Description:** {hunk.get('description', 'N/A')}\n"
+        text += f"**Change summary:** {hunk.get('change_summary', 'N/A')}\n"
+        if include_code and hunk.get("deobfuscated_code"):
+            text += f"**Deobfuscated code:**\n```\n{hunk['deobfuscated_code']}\n```\n"
+    return text
+
+
+def _summarize_file_with_claude(file_path, hunks, old_tag, new_tag, model):
+    """Summarize changes for a single file using Claude."""
+    analysis_text = _build_file_analysis_text(hunks, include_code=True)
+    # If still too large without code, strip it
+    if len(analysis_text) > 80000:
+        analysis_text = _build_file_analysis_text(hunks, include_code=False)
+
+    prompt = f"""Summarize the changes in this file between two releases of Claude Desktop (Electron app).
+
+**Old release:** {old_tag}
+**New release:** {new_tag}
+**File:** {file_path}
+**Hunks analyzed:** {len(hunks)}
+
+{analysis_text}
+
+Write a concise summary (1-5 bullet points) of the substantive changes in this file.
+Focus on functional/behavioral changes, not minified name shuffles. Omit hunks that failed."""
+
+    try:
+        result = _run_claude_cli(
+            ["claude", "-p", "--model", model, "--dangerously-skip-permissions"],
+            input_text=prompt, timeout_secs=180
+        )
+        if result.returncode != 0:
+            return f"- {file_path}: summary failed ({result.stderr[:200]})"
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        return f"- {file_path}: summary timed out"
+    except Exception as e:
+        return f"- {file_path}: summary error ({e})"
+
+
+# Max chars of analysis text that fits comfortably in a single summary call
+_SUMMARY_SINGLE_STAGE_LIMIT = 100000
+
+
 def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus"):
     """Generate a cohesive summary from all per-hunk analyses using Claude.
+
+    For small diffs, sends all analyses in one prompt. For large diffs
+    (e.g., difflib fallback on big bundles), uses a two-stage approach:
+    first summarize each file independently, then combine.
 
     Args:
         all_analyses: List of dicts with file path and hunk analyses
@@ -964,16 +1091,44 @@ def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus"):
         if not hunks:
             continue
         analysis_text += f"\n## {file_path}\n"
-        for i, hunk in enumerate(hunks):
-            if "error" in hunk and hunk["error"]:
-                analysis_text += f"\n### Hunk {i + 1} (analysis failed: {hunk['error']})\n"
-                continue
-            analysis_text += f"\n### Hunk {i + 1}\n"
-            analysis_text += f"**Description:** {hunk.get('description', 'N/A')}\n"
-            analysis_text += f"**Change summary:** {hunk.get('change_summary', 'N/A')}\n"
-            if hunk.get("deobfuscated_code"):
-                analysis_text += f"**Deobfuscated code:**\n```\n{hunk['deobfuscated_code']}\n```\n"
+        analysis_text += _build_file_analysis_text(hunks, include_code=True)
 
+    # If the analysis text is small enough, use single-stage summary
+    if len(analysis_text) <= _SUMMARY_SINGLE_STAGE_LIMIT:
+        return _generate_final_summary(analysis_text, old_tag, new_tag, model)
+
+    # Two-stage summary: per-file first, then combine
+    print("    Analysis too large for single prompt, using two-stage summary...")
+    file_summaries = []
+    for file_analysis in all_analyses:
+        file_path = file_analysis["file"]
+        hunks = file_analysis["hunks"]
+        if not hunks:
+            continue
+        ok_hunks = [h for h in hunks if not ("error" in h and h["error"])]
+        if not ok_hunks:
+            continue
+
+        file_text = _build_file_analysis_text(ok_hunks, include_code=False)
+        if len(file_text) > _SUMMARY_SINGLE_STAGE_LIMIT:
+            # Very large file — needs its own summarization pass
+            print(f"    Summarizing {file_path} ({len(ok_hunks)} hunks)...")
+            summary = _summarize_file_with_claude(
+                file_path, ok_hunks, old_tag, new_tag, model)
+            file_summaries.append(f"\n## {file_path}\n{summary}")
+        else:
+            file_summaries.append(f"\n## {file_path}\n{file_text}")
+
+    combined = "\n".join(file_summaries)
+    # If combined per-file summaries still too large, truncate
+    if len(combined) > _SUMMARY_SINGLE_STAGE_LIMIT:
+        combined = combined[:_SUMMARY_SINGLE_STAGE_LIMIT] + "\n\n... [remaining file summaries truncated] ...\n"
+
+    return _generate_final_summary(combined, old_tag, new_tag, model)
+
+
+def _generate_final_summary(analysis_text, old_tag, new_tag, model):
+    """Generate the final summary from (possibly pre-summarized) analysis text."""
     prompt = f"""You are summarizing the changes between two releases of Claude Desktop, an Electron application.
 
 **Old release:** {old_tag}
@@ -1071,7 +1226,8 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
             skipped_files.append((file_path, "build noise only"))
             continue
 
-        hunks = split_hunks(hunks_text, use_difft)
+        file_used_difft = fr.get("diff_engine", "difftastic" if use_difft else "difflib") == "difftastic"
+        hunks = split_hunks(hunks_text, file_used_difft)
         string_changes = {
             "new_strings": new_strings,
             "removed_strings": removed_strings,
@@ -1079,9 +1235,9 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
 
         for idx, hunk in enumerate(hunks):
             # Skip hunks where difftastic fell back to text mode (not useful for analysis)
-            if use_difft and "exceeded DFT_" in hunk.get("header", ""):
+            if file_used_difft and "exceeded DFT_" in hunk.get("header", ""):
                 continue
-            if is_build_noise_only(hunk["content"], use_difft=use_difft):
+            if is_build_noise_only(hunk["content"], use_difft=file_used_difft):
                 continue
             all_hunk_tasks.append({
                 "file": file_path,
