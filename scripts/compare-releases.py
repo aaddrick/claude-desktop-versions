@@ -849,6 +849,398 @@ def are_string_changes_noise_only(new_strings, removed_strings):
     return False
 
 
+# Hunk size thresholds for tiered analysis
+HUNK_SIZE_THRESHOLD = 40_000  # bytes — triggers Tier 2/3 preprocessing
+LONG_LINE_THRESHOLD = 2_000  # chars — indicates minified JS (sub-line diffing vs raw chunking)
+MAX_STRING_CONTEXT = 5_000  # max chars of string context in prompts
+MAX_STRING_LENGTH = 200  # truncate individual strings in context
+
+
+def compute_subline_diff(removed_lines, added_lines):
+    """Compute a statement-level diff for minified JS with long lines.
+
+    Splits removed/added lines on semicolons into individual statements,
+    normalizes minified identifiers, and uses SequenceMatcher to find
+    semantically meaningful changes (filtering out pure renames).
+
+    Args:
+        removed_lines: List of removed line strings (without - prefix)
+        added_lines: List of added line strings (without + prefix)
+
+    Returns:
+        (diff_text, stats) where diff_text is a formatted diff string
+        and stats is a dict with counts.
+    """
+    def split_statements(lines):
+        """Split lines on semicolons into individual statements."""
+        text = "\n".join(lines)
+        # Split on ; but keep the ; attached to the preceding statement
+        raw = re.split(r'(;)', text)
+        statements = []
+        for i in range(0, len(raw) - 1, 2):
+            stmt = raw[i] + (raw[i + 1] if i + 1 < len(raw) else "")
+            stmt = stmt.strip()
+            if stmt:
+                statements.append(stmt)
+        # Handle trailing content after last ;
+        if len(raw) % 2 == 1 and raw[-1].strip():
+            statements.append(raw[-1].strip())
+        return statements
+
+    # If too few statements, return original lines directly
+    removed_stmts = split_statements(removed_lines)
+    added_stmts = split_statements(added_lines)
+
+    if len(removed_stmts) < 5 and len(added_stmts) < 5:
+        diff_lines = []
+        for line in removed_lines:
+            diff_lines.append(f"- {line}")
+        for line in added_lines:
+            diff_lines.append(f"+ {line}")
+        return "\n".join(diff_lines), {
+            "removed_stmts": len(removed_stmts),
+            "added_stmts": len(added_stmts),
+            "changed_stmts": len(removed_stmts) + len(added_stmts),
+            "method": "raw_lines",
+        }
+
+    # Normalize for comparison
+    norm_removed = [_normalize_minified_names(s) for s in removed_stmts]
+    norm_added = [_normalize_minified_names(s) for s in added_stmts]
+
+    matcher = difflib.SequenceMatcher(None, norm_removed, norm_added, autojunk=False)
+    diff_lines = []
+    changed_count = 0
+
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == "equal":
+            continue
+        # Add 1 statement of context before and after
+        ctx_before_r = max(0, i1 - 1)
+        ctx_after_r = min(len(removed_stmts), i2 + 1)
+        ctx_before_a = max(0, j1 - 1)
+        ctx_after_a = min(len(added_stmts), j2 + 1)
+
+        if op == "replace":
+            # Check if this is just a minified rename
+            if norm_removed[i1:i2] == norm_added[j1:j2]:
+                continue  # Pure rename, skip
+            changed_count += (i2 - i1) + (j2 - j1)
+            # Context before
+            if ctx_before_r < i1:
+                diff_lines.append(f"  {removed_stmts[ctx_before_r]}")
+            for s in removed_stmts[i1:i2]:
+                diff_lines.append(f"- {s}")
+            for s in added_stmts[j1:j2]:
+                diff_lines.append(f"+ {s}")
+            # Context after
+            if i2 < ctx_after_r:
+                diff_lines.append(f"  {removed_stmts[i2]}")
+            diff_lines.append("---")
+        elif op == "delete":
+            changed_count += i2 - i1
+            if ctx_before_r < i1:
+                diff_lines.append(f"  {removed_stmts[ctx_before_r]}")
+            for s in removed_stmts[i1:i2]:
+                diff_lines.append(f"- {s}")
+            if i2 < ctx_after_r:
+                diff_lines.append(f"  {removed_stmts[i2]}")
+            diff_lines.append("---")
+        elif op == "insert":
+            changed_count += j2 - j1
+            if ctx_before_a < j1:
+                diff_lines.append(f"  {added_stmts[ctx_before_a]}")
+            for s in added_stmts[j1:j2]:
+                diff_lines.append(f"+ {s}")
+            if j2 < ctx_after_a:
+                diff_lines.append(f"  {added_stmts[j2]}")
+            diff_lines.append("---")
+
+    diff_text = "\n".join(diff_lines)
+    stats = {
+        "removed_stmts": len(removed_stmts),
+        "added_stmts": len(added_stmts),
+        "changed_stmts": changed_count,
+        "method": "subline_diff",
+    }
+    return diff_text, stats
+
+
+def chunk_subline_diff(diff_text, max_size=HUNK_SIZE_THRESHOLD):
+    """Split a subline diff into chunks that fit within max_size.
+
+    Splits on '---' separator lines between change regions, greedily
+    accumulating into chunks.
+
+    Args:
+        diff_text: The formatted subline diff text
+        max_size: Maximum size per chunk in chars
+
+    Returns:
+        List of chunk strings.
+    """
+    if len(diff_text) <= max_size:
+        return [diff_text]
+
+    regions = diff_text.split("\n---\n")
+    chunks = []
+    current = ""
+
+    for region in regions:
+        region = region.strip()
+        if not region:
+            continue
+        candidate = (current + "\n---\n" + region).strip() if current else region
+        if len(candidate) <= max_size:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            # If single region exceeds max_size, include it anyway (will be truncated by Claude)
+            current = region
+
+    if current:
+        chunks.append(current)
+
+    return chunks if chunks else [diff_text[:max_size]]
+
+
+def build_string_fallback_content(hunk_content, new_strings, removed_strings):
+    """Build a string-change summary as Tier 3 fallback for oversized hunks.
+
+    Extracts strings from the hunk's added/removed lines, computes the
+    hunk-local string diff, and filters noise.
+
+    Args:
+        hunk_content: The raw diff hunk text
+        new_strings: File-level new strings list
+        removed_strings: File-level removed strings list
+
+    Returns:
+        Formatted string-change summary text.
+    """
+    # Extract +/- lines from the hunk
+    added_text = []
+    removed_text = []
+    for line in hunk_content.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added_text.append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            removed_text.append(line[1:])
+
+    # Extract strings from hunk-local added/removed content
+    hunk_added_strings = extract_strings("\n".join(added_text))
+    hunk_removed_strings = extract_strings("\n".join(removed_text))
+
+    # Compute hunk-local new/removed strings
+    hunk_new = hunk_added_strings - hunk_removed_strings
+    hunk_removed = hunk_removed_strings - hunk_added_strings
+
+    # Filter noise
+    def filter_noise(strings):
+        return [s for s in sorted(strings)
+                if not any(p.match(s) for p in STRING_NOISE_PATTERNS)]
+
+    hunk_new_filtered = filter_noise(hunk_new)
+    hunk_removed_filtered = filter_noise(hunk_removed)
+
+    lines = []
+    lines.append(f"## Hunk String Changes (extracted from {len(hunk_content)} char hunk)")
+    lines.append(f"Total hunk-local: +{len(hunk_new_filtered)} -{len(hunk_removed_filtered)} strings (after noise filter)")
+    lines.append("")
+
+    if hunk_new_filtered:
+        lines.append("### New strings/tokens in this hunk:")
+        for s in hunk_new_filtered[:100]:
+            truncated = s[:MAX_STRING_LENGTH] + "..." if len(s) > MAX_STRING_LENGTH else s
+            lines.append(f"+ {truncated}")
+        if len(hunk_new_filtered) > 100:
+            lines.append(f"  ... and {len(hunk_new_filtered) - 100} more")
+    lines.append("")
+
+    if hunk_removed_filtered:
+        lines.append("### Removed strings/tokens in this hunk:")
+        for s in hunk_removed_filtered[:100]:
+            truncated = s[:MAX_STRING_LENGTH] + "..." if len(s) > MAX_STRING_LENGTH else s
+            lines.append(f"- {truncated}")
+        if len(hunk_removed_filtered) > 100:
+            lines.append(f"  ... and {len(hunk_removed_filtered) - 100} more")
+
+    return "\n".join(lines)
+
+
+def chunk_raw_hunk(content, max_size=HUNK_SIZE_THRESHOLD):
+    """Split a non-minified large hunk at change-cluster boundaries.
+
+    For unified diffs, groups consecutive change lines (+/-) with their
+    surrounding context into clusters, then greedily combines clusters
+    into chunks within max_size.
+
+    Args:
+        content: The unified diff hunk text
+        max_size: Maximum size per chunk in chars
+
+    Returns:
+        List of chunk strings.
+    """
+    if len(content) <= max_size:
+        return [content]
+
+    lines = content.splitlines(keepends=True)
+    # Find clusters of change lines with context
+    clusters = []
+    current_cluster = []
+    context_before = []
+
+    for line in lines:
+        is_change = line.startswith("+") or line.startswith("-")
+        is_header = line.startswith("@@") or line.startswith("---") or line.startswith("+++")
+
+        if is_header:
+            if current_cluster:
+                clusters.append("".join(current_cluster))
+                current_cluster = []
+            context_before = []
+            continue
+
+        if is_change:
+            if not current_cluster and context_before:
+                # Add up to 3 lines of context before
+                current_cluster.extend(context_before[-3:])
+            current_cluster.append(line)
+        else:
+            if current_cluster:
+                # Context line after changes — add up to 3, then break cluster
+                current_cluster.append(line)
+                if len([l for l in current_cluster if not (l.startswith("+") or l.startswith("-"))]) >= 3:
+                    clusters.append("".join(current_cluster))
+                    current_cluster = []
+                    context_before = []
+                    continue
+            context_before.append(line)
+
+    if current_cluster:
+        clusters.append("".join(current_cluster))
+
+    if not clusters:
+        # Fallback: just split by size
+        return [content[i:i + max_size] for i in range(0, len(content), max_size)]
+
+    # Greedily combine clusters into chunks
+    chunks = []
+    current = ""
+    for cluster in clusters:
+        candidate = current + "\n...\n" + cluster if current else cluster
+        if len(candidate) <= max_size:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = cluster if len(cluster) <= max_size else cluster[:max_size]
+
+    if current:
+        chunks.append(current)
+
+    return chunks if chunks else [content[:max_size]]
+
+
+def preprocess_hunk(hunk_dict, string_changes):
+    """Preprocess a hunk for analysis, routing to the appropriate tier.
+
+    Tier 1: Hunk < HUNK_SIZE_THRESHOLD → direct analysis (unchanged path)
+    Tier 2: Oversized hunk with long lines → sub-line statement diffing
+    Tier 3: Build string fallback content for anything still too large
+
+    Args:
+        hunk_dict: Dict with 'content', 'header', etc. from split_hunks()
+        string_changes: Dict with 'new_strings' and 'removed_strings'
+
+    Returns:
+        List of dicts: [{"content", "tier", "original_size", "header", ...}]
+    """
+    content = hunk_dict["content"]
+    header = hunk_dict.get("header", "")
+    original_size = len(content)
+
+    # Tier 1: small enough for direct analysis
+    if original_size <= HUNK_SIZE_THRESHOLD:
+        return [{
+            "content": content,
+            "tier": "direct",
+            "original_size": original_size,
+            "header": header,
+        }]
+
+    # Check if lines are long (minified JS)
+    lines = content.splitlines()
+    max_line_len = max((len(l) for l in lines), default=0)
+
+    if max_line_len >= LONG_LINE_THRESHOLD:
+        # Tier 2: sub-line statement diffing for minified JS
+        removed_lines = []
+        added_lines = []
+        for line in lines:
+            if line.startswith("-") and not line.startswith("---"):
+                removed_lines.append(line[1:])
+            elif line.startswith("+") and not line.startswith("+++"):
+                added_lines.append(line[1:])
+
+        if not removed_lines and not added_lines:
+            # No actual changes, just context
+            return [{
+                "content": content,
+                "tier": "direct",
+                "original_size": original_size,
+                "header": header,
+            }]
+
+        diff_text, stats = compute_subline_diff(removed_lines, added_lines)
+
+        if not diff_text.strip():
+            # All changes were pure renames
+            print(f"      Tier 2: all changes are minified renames ({original_size} chars → noise)")
+            return [{
+                "content": "",
+                "tier": "noise",
+                "original_size": original_size,
+                "header": header,
+                "stats": stats,
+            }]
+
+        reduction = (1 - len(diff_text) / original_size) * 100
+        print(f"      Tier 2: subline diff {original_size} → {len(diff_text)} chars ({reduction:.0f}% reduction, {stats['changed_stmts']} changed stmts)")
+
+        # Chunk if still too large
+        chunks = chunk_subline_diff(diff_text)
+        results = []
+        for i, chunk in enumerate(chunks):
+            results.append({
+                "content": chunk,
+                "tier": "subline",
+                "original_size": original_size,
+                "header": header,
+                "chunk_index": i,
+                "total_chunks": len(chunks),
+                "stats": stats,
+            })
+        return results
+    else:
+        # Large hunk but not minified — chunk at change-cluster boundaries
+        chunks = chunk_raw_hunk(content)
+        print(f"      Chunked large hunk: {original_size} chars → {len(chunks)} chunks")
+        results = []
+        for i, chunk in enumerate(chunks):
+            results.append({
+                "content": chunk,
+                "tier": "direct",
+                "original_size": original_size,
+                "header": header,
+                "chunk_index": i,
+                "total_chunks": len(chunks),
+            })
+        return results
+
+
 # Rate limit retry settings
 RATE_LIMIT_MAX_RETRIES = 3
 RATE_LIMIT_BASE_WAIT = 60  # seconds
@@ -953,7 +1345,7 @@ HUNK_ANALYSIS_SCHEMA = json.dumps({
 })
 
 
-def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="sonnet"):
+def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="sonnet", tier="direct"):
     """Analyze a single diff hunk using Claude CLI.
 
     Args:
@@ -961,6 +1353,7 @@ def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="son
         file_path: Path of the file being analyzed
         string_changes: Dict with 'new_strings' and 'removed_strings' for context
         model: Claude model to use (default: sonnet)
+        tier: Analysis tier - "direct", "subline", or "string_fallback"
 
     Returns:
         Parsed JSON dict with analysis, or error dict on failure.
@@ -968,15 +1361,64 @@ def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="son
     new_strings = string_changes.get("new_strings", [])
     removed_strings = string_changes.get("removed_strings", [])
 
+    # Cap string context to avoid bloating the prompt
+    def _cap_strings(strings, max_total=MAX_STRING_CONTEXT):
+        result = []
+        total = 0
+        for s in strings:
+            truncated = s[:MAX_STRING_LENGTH] + "..." if len(s) > MAX_STRING_LENGTH else s
+            entry = f"- {truncated}"
+            if total + len(entry) > max_total:
+                result.append(f"- ... ({len(strings) - len(result)} more truncated)")
+                break
+            result.append(entry)
+            total += len(entry)
+        return result
+
     context_section = ""
     if new_strings or removed_strings:
         context_section = "\n\n## String Changes in This File\n"
         if new_strings:
-            context_section += "New strings:\n" + "\n".join(f"- {s}" for s in new_strings[:30]) + "\n"
+            context_section += "New strings:\n" + "\n".join(_cap_strings(new_strings)) + "\n"
         if removed_strings:
-            context_section += "Removed strings:\n" + "\n".join(f"- {s}" for s in removed_strings[:30]) + "\n"
+            context_section += "Removed strings:\n" + "\n".join(_cap_strings(removed_strings)) + "\n"
 
-    prompt = f"""You are analyzing a diff hunk from a minified/bundled Electron desktop application (Claude Desktop).
+    if tier == "subline":
+        prompt = f"""You are analyzing statement-level changes extracted from a minified/bundled Electron desktop application (Claude Desktop).
+The diff below shows individual JavaScript statements that changed between versions.
+Minified identifier renames have already been filtered out — what remains are semantic/functional changes.
+Lines prefixed with '-' were removed, '+' were added, unprefixed lines are context.
+
+## File: {file_path}
+{context_section}
+## Statement-Level Changes
+```
+{hunk_content}
+```
+
+## Instructions
+1. Guess meaningful names for minified identifiers based on usage context, string literals, API calls, and patterns.
+2. Describe what the changed statements do.
+3. Describe what *changed* — the functional/behavioral delta, not just syntactic differences.
+
+Return your analysis as JSON."""
+    elif tier == "string_fallback":
+        prompt = f"""You are analyzing string and API changes extracted from an oversized diff hunk in a minified/bundled Electron desktop application (Claude Desktop).
+The full code diff was too large to analyze directly, so only the string literals, URLs, imports, and property names that changed are shown below.
+
+## File: {file_path}
+
+## String/API Changes
+{hunk_content}
+
+## Instructions
+1. Based on the string changes, infer what new features, APIs, or behaviors were added or removed.
+2. Describe the likely functional changes.
+3. Note any significant new URLs, error messages, feature flags, or configuration keys.
+
+Return your analysis as JSON."""
+    else:
+        prompt = f"""You are analyzing a diff hunk from a minified/bundled Electron desktop application (Claude Desktop).
 The code has been beautified but identifiers are still minified (single letters, short meaningless names).
 
 ## File: {file_path}
@@ -1192,16 +1634,26 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
     if progress_path.exists():
         try:
             progress = json.loads(progress_path.read_text())
+            failed_count = 0
             for h in progress.get("hunks", []):
                 if h.get("status") == "completed":
+                    # Only skip hunks that succeeded — retry failed ones
+                    if h.get("result", {}).get("error"):
+                        failed_count += 1
+                        continue
                     completed_keys.add((h["file"], h["hunk_index"]))
-            print(f"  Resuming from progress file: {progress.get('completed_hunks', 0)} hunks already done")
+                    # Also support new progress_key format
+                    if "progress_key" in h:
+                        completed_keys.add((h["file"], h["progress_key"]))
+            ok_count = len(completed_keys)
+            print(f"  Resuming from progress file: {ok_count} hunks succeeded, {failed_count} failed (will retry)")
         except (json.JSONDecodeError, KeyError):
             progress = {"status": "in_progress", "total_hunks": 0, "completed_hunks": 0, "hunks": []}
 
-    # Build list of all hunks to analyze
+    # Build list of all hunks to analyze, with preprocessing for oversized hunks
     all_hunk_tasks = []
     skipped_files = []
+    noise_hunks = 0
     for fr in file_reports:
         if fr["status"] not in ("modified", "renamed"):
             continue
@@ -1239,16 +1691,35 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
                 continue
             if is_build_noise_only(hunk["content"], use_difft=file_used_difft):
                 continue
-            all_hunk_tasks.append({
-                "file": file_path,
-                "hunk_index": idx,
-                "hunk_header": hunk["header"],
-                "content": hunk["content"],
-                "string_changes": string_changes,
-            })
+
+            # Preprocess oversized hunks
+            preprocessed = preprocess_hunk(hunk, string_changes)
+            for sub_idx, item in enumerate(preprocessed):
+                if item["tier"] == "noise":
+                    noise_hunks += 1
+                    continue
+                if not item["content"].strip():
+                    continue
+
+                # Build a unique key for progress tracking
+                # Use (file, hunk_index, sub_index) for chunked hunks
+                sub_key = f"{idx}" if len(preprocessed) == 1 else f"{idx}.{sub_idx}"
+                all_hunk_tasks.append({
+                    "file": file_path,
+                    "hunk_index": idx,
+                    "sub_index": sub_idx,
+                    "progress_key": sub_key,
+                    "hunk_header": item.get("header", hunk["header"]),
+                    "content": item["content"],
+                    "tier": item["tier"],
+                    "original_size": item.get("original_size", len(hunk["content"])),
+                    "string_changes": string_changes,
+                })
 
     if skipped_files:
         print(f"  Skipped {len(skipped_files)} files: {', '.join(f'{f} ({r})' for f, r in skipped_files)}")
+    if noise_hunks:
+        print(f"  Filtered {noise_hunks} noise-only hunks (pure minified renames)")
 
     total = len(all_hunk_tasks)
     progress["total_hunks"] = total
@@ -1261,38 +1732,78 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
         summary_path.write_text("# No Substantive Changes\n\nAll changes between releases appear to be build artifacts (hashes, UUIDs, version strings).\n")
         return
 
-    # Analyze each hunk
-    completed = progress.get("completed_hunks", 0)
+    # Analyze each hunk — count how many need work vs already done
+    tasks_to_run = []
+    already_done = 0
     for task in all_hunk_tasks:
         key = (task["file"], task["hunk_index"])
-        if key in completed_keys:
-            continue
+        new_key = (task["file"], task["progress_key"])
+        if key in completed_keys or new_key in completed_keys:
+            already_done += 1
+        else:
+            tasks_to_run.append(task)
 
+    if already_done:
+        print(f"  Skipping {already_done} already-completed hunks")
+
+    completed = 0
+    remaining = len(tasks_to_run)
+    for task in tasks_to_run:
         completed += 1
-        print(f"  [{completed}/{total}] Analyzing {task['file']} hunk {task['hunk_index']}...")
+        tier_label = f" [{task['tier']}]" if task["tier"] != "direct" else ""
+        size_label = f" (preprocessed from {task['original_size']} chars)" if task["original_size"] > HUNK_SIZE_THRESHOLD else ""
+        print(f"  [{completed}/{remaining}] Analyzing {task['file']} hunk {task['progress_key']}{tier_label}{size_label}...")
 
         result = analyze_hunk_with_claude(
-            task["content"], task["file"], task["string_changes"]
+            task["content"], task["file"], task["string_changes"],
+            tier=task["tier"]
         )
+
+        # On failure for oversized hunks, try Tier 3 string fallback
+        if result.get("error") and task["original_size"] > HUNK_SIZE_THRESHOLD and task["tier"] != "string_fallback":
+            print(f"    Tier {task['tier']} failed, falling back to string analysis...")
+            fallback_content = build_string_fallback_content(
+                task["content"],
+                task["string_changes"].get("new_strings", []),
+                task["string_changes"].get("removed_strings", []),
+            )
+            if fallback_content.strip():
+                result = analyze_hunk_with_claude(
+                    fallback_content, task["file"], task["string_changes"],
+                    tier="string_fallback"
+                )
 
         hunk_entry = {
             "file": task["file"],
             "hunk_index": task["hunk_index"],
+            "progress_key": task["progress_key"],
             "hunk_header": task["hunk_header"],
+            "tier": task["tier"],
+            "original_size": task["original_size"],
             "status": "completed",
             "result": result,
         }
         progress["hunks"].append(hunk_entry)
-        progress["completed_hunks"] = completed
+        progress["completed_hunks"] = already_done + completed
         progress_path.write_text(json.dumps(progress, indent=2))
 
     progress["status"] = "analysis_complete"
     progress_path.write_text(json.dumps(progress, indent=2))
 
-    # Group results by file for summary
-    file_analyses = {}
+    # Group results by file for summary, using latest result per hunk key
+    # (handles retries where multiple entries exist for the same hunk)
+    latest_by_key = {}
     for h in progress["hunks"]:
         if h["status"] != "completed":
+            continue
+        # Use progress_key if available, fall back to hunk_index
+        key = (h["file"], h.get("progress_key", h["hunk_index"]))
+        latest_by_key[key] = h  # later entries overwrite earlier (failed) ones
+
+    file_analyses = {}
+    for h in latest_by_key.values():
+        # Skip entries that still have errors after retries
+        if h.get("result", {}).get("error"):
             continue
         f = h["file"]
         if f not in file_analyses:
