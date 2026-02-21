@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 
@@ -49,6 +50,20 @@ def has_claude_cli():
 
 HAS_DIFFT = None  # lazy-initialized
 HAS_CLAUDE = None  # lazy-initialized
+
+
+def fetch_voice_profile(url):
+    """Fetch a voice profile from a URL. Returns the content as a string, or None on failure."""
+    try:
+        print(f"  Fetching voice profile from {url}...")
+        req = urllib.request.Request(url, headers={"User-Agent": "compare-releases/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode("utf-8")
+        print(f"  Voice profile fetched ({len(content)} chars)")
+        return content
+    except Exception as e:
+        print(f"  Warning: Failed to fetch voice profile: {e}")
+        return None
 
 
 def get_has_difft():
@@ -1509,7 +1524,7 @@ Focus on functional/behavioral changes, not minified name shuffles. Omit hunks t
 _SUMMARY_SINGLE_STAGE_LIMIT = 100000
 
 
-def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus"):
+def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus", voice_profile=None):
     """Generate a cohesive summary from all per-hunk analyses using Claude.
 
     For small diffs, sends all analyses in one prompt. For large diffs
@@ -1521,6 +1536,7 @@ def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus"):
         old_tag: Old release tag
         new_tag: New release tag
         model: Claude model to use (default: opus)
+        voice_profile: Optional voice profile text for styling the summary
 
     Returns:
         Summary markdown string.
@@ -1537,7 +1553,7 @@ def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus"):
 
     # If the analysis text is small enough, use single-stage summary
     if len(analysis_text) <= _SUMMARY_SINGLE_STAGE_LIMIT:
-        return _generate_final_summary(analysis_text, old_tag, new_tag, model)
+        return _generate_final_summary(analysis_text, old_tag, new_tag, model, voice_profile)
 
     # Two-stage summary: per-file first, then combine
     print("    Analysis too large for single prompt, using two-stage summary...")
@@ -1566,11 +1582,24 @@ def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus"):
     if len(combined) > _SUMMARY_SINGLE_STAGE_LIMIT:
         combined = combined[:_SUMMARY_SINGLE_STAGE_LIMIT] + "\n\n... [remaining file summaries truncated] ...\n"
 
-    return _generate_final_summary(combined, old_tag, new_tag, model)
+    return _generate_final_summary(combined, old_tag, new_tag, model, voice_profile)
 
 
-def _generate_final_summary(analysis_text, old_tag, new_tag, model):
+def _generate_final_summary(analysis_text, old_tag, new_tag, model, voice_profile=None):
     """Generate the final summary from (possibly pre-summarized) analysis text."""
+    voice_section = ""
+    if voice_profile:
+        voice_section = f"""
+## Writing Style
+
+Write the summary in the voice described by this profile. Match the tone, sentence rhythm,
+and structural patterns. The voice is friendly, direct, and technically competent.
+
+<voice-profile>
+{voice_profile}
+</voice-profile>
+"""
+
     prompt = f"""You are summarizing the changes between two releases of Claude Desktop, an Electron application.
 
 **Old release:** {old_tag}
@@ -1582,19 +1611,31 @@ to deobfuscate minified names and describe what changed.
 {analysis_text}
 
 ## Instructions
-Write a comprehensive summary document with:
+Write a concise release notes summary. Focus on changes that matter to users and developers.
 
-1. **Executive Summary**: A 2-3 sentence overview of what changed between these releases.
-2. **Changes by Category**: Group changes into:
-   - New Features
-   - Bug Fixes
-   - Refactors / Internal Changes
-   - Dependency Updates
-   - Build/Config Changes
-3. **Detailed Changes**: For each substantive change, describe what it does in plain language.
-4. **Confidence Assessment**: Note which changes you're confident about vs which are harder to determine from minified code.
+**Skip mundane/routine items entirely** — do NOT include:
+- IPC channel UUID rotations (these happen every build)
+- Minifier variable renames or re-identifier passes
+- Vite content hash rotations
+- Sentry release SHA updates
+- Build timestamp changes
+- Any change that is purely a mechanical side-effect of the build process
 
-Write in markdown format. Be concise but thorough."""
+**Do include:**
+- New features and capabilities
+- Bug fixes
+- Meaningful dependency additions or major version bumps
+- Behavioral changes, API changes, or refactors that affect functionality
+- CSS/UI changes that affect what users see
+
+Structure the summary with:
+1. A brief overview (2-3 sentences) of the highlights
+2. Sections for notable changes, grouped naturally (features, fixes, dependency updates, etc.)
+3. Keep descriptions clear and practical — explain what changed and why it matters
+
+Do NOT include a confidence assessment table. If you're unsure about something, note it inline.
+{voice_section}
+Write in markdown format."""
 
     try:
         result = _run_claude_cli(
@@ -1611,7 +1652,7 @@ Write in markdown format. Be concise but thorough."""
         return f"# Summary Generation Failed\n\nUnexpected error: {e}"
 
 
-def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="opus"):
+def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="opus", voice_profile=None):
     """Orchestrate Claude analysis of all changed hunks.
 
     Manages progress tracking, per-hunk analysis, and final summary generation.
@@ -1622,6 +1663,7 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
         old_tag: Old release tag
         new_tag: New release tag
         summary_model: Model to use for final summary (default: opus)
+        voice_profile: Optional voice profile text for styling the summary
     """
     workdir = Path(workdir)
     progress_path = workdir / "analysis-progress.json"
@@ -1814,7 +1856,7 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
 
     # Generate summary
     print(f"\n  Generating summary with {summary_model}...")
-    summary = generate_summary_with_claude(all_analyses, old_tag, new_tag, model=summary_model)
+    summary = generate_summary_with_claude(all_analyses, old_tag, new_tag, model=summary_model, voice_profile=voice_profile)
 
     summary_path.write_text(summary)
     progress["status"] = "completed"
@@ -1833,14 +1875,23 @@ def main():
                         help="Working directory (default: ./compare-work)")
     parser.add_argument("--keep", action="store_true",
                         help="Keep extracted/beautified files after run")
+    parser.add_argument("--new-appimage",
+                        help="Path to a local AppImage for the new version (skip download)")
     parser.add_argument("--no-analyze", action="store_true",
                         help="Skip Claude-powered analysis step (produce only raw reports)")
     parser.add_argument("--model", default="opus",
                         help="Model for summary generation (default: opus)")
+    parser.add_argument("--voice-profile-url",
+                        help="URL to a voice profile .md file for styling the summary")
     args = parser.parse_args()
 
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
+
+    # Fetch voice profile if requested
+    voice_profile = None
+    if args.voice_profile_url:
+        voice_profile = fetch_voice_profile(args.voice_profile_url)
 
     # Step 1: Resolve releases
     print("=== Step 1: Resolving releases ===")
@@ -1858,7 +1909,13 @@ def main():
     # Step 2: Download AppImages
     print("\n=== Step 2: Downloading AppImages ===")
     old_appimage = download_appimage(old_tag, old_work)
-    new_appimage = download_appimage(new_tag, new_work)
+    if args.new_appimage:
+        new_appimage = Path(args.new_appimage).resolve()
+        if not new_appimage.exists():
+            raise FileNotFoundError(f"Local AppImage not found: {new_appimage}")
+        print(f"  Using local AppImage: {new_appimage}")
+    else:
+        new_appimage = download_appimage(new_tag, new_work)
 
     # Step 3: Extract AppImages
     print("\n=== Step 3: Extracting AppImages ===")
@@ -1908,7 +1965,7 @@ def main():
     if not args.no_analyze:
         if get_has_claude():
             print("\n=== Step 8: Claude-powered analysis ===")
-            run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model=args.model)
+            run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model=args.model, voice_profile=voice_profile)
         else:
             print("\n=== Step 8: Skipped (claude CLI not found) ===")
             print("  Install the claude CLI to enable AI-powered change analysis.")
