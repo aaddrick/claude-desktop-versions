@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import urllib.request
 from pathlib import Path
@@ -1343,24 +1345,25 @@ def _extract_structured_output(response_json):
 HUNK_ANALYSIS_SCHEMA = json.dumps({
     "type": "object",
     "properties": {
-        "deobfuscated_code": {
-            "type": "string",
-            "description": "The hunk code with minified identifiers replaced by meaningful names"
-        },
         "description": {
             "type": "string",
-            "description": "What the code in this hunk does"
+            "description": "What the code in this hunk does, including the purpose of key functions and logic"
         },
         "change_summary": {
             "type": "string",
             "description": "What functionally changed (not just what's different — the semantic delta)"
+        },
+        "key_identifiers": {
+            "type": "object",
+            "description": "Map of minified identifier names to guessed meaningful names, e.g. {\"e\": \"event\", \"t\": \"timeout\"}",
+            "additionalProperties": {"type": "string"}
         }
     },
-    "required": ["deobfuscated_code", "description", "change_summary"]
+    "required": ["description", "change_summary", "key_identifiers"]
 })
 
 
-def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="sonnet", tier="direct"):
+def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="haiku", tier="direct"):
     """Analyze a single diff hunk using Claude CLI.
 
     Args:
@@ -1412,9 +1415,9 @@ Lines prefixed with '-' were removed, '+' were added, unprefixed lines are conte
 ```
 
 ## Instructions
-1. Guess meaningful names for minified identifiers based on usage context, string literals, API calls, and patterns.
-2. Describe what the changed statements do.
-3. Describe what *changed* — the functional/behavioral delta, not just syntactic differences.
+1. Describe what the changed statements do.
+2. Describe what *changed* — the functional/behavioral delta, not just syntactic differences.
+3. Provide a key_identifiers map of important minified names to guessed meaningful names.
 
 Return your analysis as JSON."""
     elif tier == "string_fallback":
@@ -1444,13 +1447,13 @@ The code has been beautified but identifiers are still minified (single letters,
 ```
 
 ## Instructions
-1. Guess meaningful names for minified identifiers based on usage context, string literals, API calls, and patterns.
-2. Describe what the code in this hunk does.
-3. Describe what *changed* — not just what's different, but the functional/behavioral delta.
+1. Describe what the code in this hunk does.
+2. Describe what *changed* — not just what's different, but the functional/behavioral delta.
+3. Provide a key_identifiers map of important minified names to guessed meaningful names.
 
 Return your analysis as JSON."""
 
-    error_stub = {"deobfuscated_code": "", "description": "", "change_summary": ""}
+    error_stub = {"description": "", "change_summary": "", "key_identifiers": {}}
     try:
         result = _run_claude_cli(
             ["claude", "-p", "--model", model,
@@ -1472,6 +1475,165 @@ Return your analysis as JSON."""
         return {"error": f"Unexpected error: {e}", **error_stub}
 
 
+# JSON schema for batched hunk analysis (array of per-hunk results)
+HUNK_BATCH_SCHEMA = json.dumps({
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "hunk_index": {
+                "type": "integer",
+                "description": "The 1-based hunk number from the prompt"
+            },
+            "description": {
+                "type": "string",
+                "description": "What the code in this hunk does, including the purpose of key functions and logic"
+            },
+            "change_summary": {
+                "type": "string",
+                "description": "What functionally changed (not just what's different — the semantic delta)"
+            },
+            "key_identifiers": {
+                "type": "object",
+                "description": "Map of minified identifier names to guessed meaningful names",
+                "additionalProperties": {"type": "string"}
+            }
+        },
+        "required": ["hunk_index", "description", "change_summary", "key_identifiers"]
+    }
+})
+
+
+def _batch_hunk_tasks(tasks, max_batch_chars=30000):
+    """Group consecutive same-file hunk tasks into batches.
+
+    Args:
+        tasks: List of hunk task dicts (must share the same file within a batch)
+        max_batch_chars: Max total content chars per batch
+
+    Returns:
+        List of lists, where each inner list is a batch of tasks to analyze together.
+    """
+    batches = []
+    current_batch = []
+    current_file = None
+    current_chars = 0
+
+    for task in tasks:
+        task_chars = len(task["content"])
+        # Start new batch if: different file, or would exceed limit, or task is non-direct tier
+        if (task["file"] != current_file or
+                current_chars + task_chars > max_batch_chars or
+                task["tier"] != "direct"):
+            if current_batch:
+                batches.append(current_batch)
+            current_batch = [task]
+            current_file = task["file"]
+            current_chars = task_chars
+        else:
+            current_batch.append(task)
+            current_chars += task_chars
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
+def analyze_hunk_batch_with_claude(batch, model="haiku"):
+    """Analyze multiple hunks from the same file in a single Claude call.
+
+    Args:
+        batch: List of hunk task dicts (all same file)
+        model: Claude model to use
+
+    Returns:
+        List of (task, result) tuples.
+    """
+    file_path = batch[0]["file"]
+    string_changes = batch[0]["string_changes"]
+    new_strings = string_changes.get("new_strings", [])
+    removed_strings = string_changes.get("removed_strings", [])
+
+    # Build string context once for the batch
+    def _cap_strings(strings, max_total=MAX_STRING_CONTEXT):
+        result = []
+        total = 0
+        for s in strings:
+            truncated = s[:MAX_STRING_LENGTH] + "..." if len(s) > MAX_STRING_LENGTH else s
+            entry = f"- {truncated}"
+            if total + len(entry) > max_total:
+                result.append(f"- ... ({len(strings) - len(result)} more truncated)")
+                break
+            result.append(entry)
+            total += len(entry)
+        return result
+
+    context_section = ""
+    if new_strings or removed_strings:
+        context_section = "\n\n## String Changes in This File\n"
+        if new_strings:
+            context_section += "New strings:\n" + "\n".join(_cap_strings(new_strings)) + "\n"
+        if removed_strings:
+            context_section += "Removed strings:\n" + "\n".join(_cap_strings(removed_strings)) + "\n"
+
+    # Build the multi-hunk prompt
+    hunks_section = ""
+    for i, task in enumerate(batch):
+        hunks_section += f"\n### Hunk {i + 1} (progress key: {task['progress_key']})\n```\n{task['content']}\n```\n"
+
+    prompt = f"""You are analyzing {len(batch)} diff hunks from a minified/bundled Electron desktop application (Claude Desktop).
+The code has been beautified but identifiers are still minified (single letters, short meaningless names).
+
+## File: {file_path}
+{context_section}
+{hunks_section}
+
+## Instructions
+For EACH hunk above, provide:
+1. A description of what the code does.
+2. What *changed* — not just what's different, but the functional/behavioral delta.
+3. A key_identifiers map of important minified names to guessed meaningful names.
+
+Return a JSON array with one object per hunk, in the same order. Each object must include `hunk_index` (1-based)."""
+
+    error_stub = {"description": "", "change_summary": "", "key_identifiers": {}}
+
+    try:
+        result = _run_claude_cli(
+            ["claude", "-p", "--model", model,
+             "--output-format", "json", "--json-schema", HUNK_BATCH_SCHEMA,
+             "--dangerously-skip-permissions"],
+            input_text=prompt, timeout_secs=180
+        )
+        if result.returncode != 0:
+            return [(task, {"error": f"Claude CLI failed: {result.stderr[:500]}", **error_stub}) for task in batch]
+
+        response = json.loads(result.stdout)
+        parsed = _extract_structured_output(response)
+
+        # Map results back to tasks by position
+        results = []
+        if isinstance(parsed, list):
+            for i, task in enumerate(batch):
+                if i < len(parsed):
+                    results.append((task, parsed[i]))
+                else:
+                    results.append((task, {"error": "Missing from batch response", **error_stub}))
+        else:
+            # Unexpected format — treat as single result for first task, error for rest
+            results.append((batch[0], parsed if isinstance(parsed, dict) else {"error": "Unexpected response format", **error_stub}))
+            for task in batch[1:]:
+                results.append((task, {"error": "Batch response was not an array", **error_stub}))
+        return results
+
+    except subprocess.TimeoutExpired:
+        return [(task, {"error": "Claude CLI timed out", **error_stub}) for task in batch]
+    except (json.JSONDecodeError, KeyError) as e:
+        return [(task, {"error": f"Failed to parse Claude response: {e}", **error_stub}) for task in batch]
+    except Exception as e:
+        return [(task, {"error": f"Unexpected error: {e}", **error_stub}) for task in batch]
+
+
 def _build_file_analysis_text(hunks, include_code=True):
     """Build analysis text for a list of hunk results."""
     text = ""
@@ -1482,8 +1644,10 @@ def _build_file_analysis_text(hunks, include_code=True):
         text += f"\n### Hunk {i + 1}\n"
         text += f"**Description:** {hunk.get('description', 'N/A')}\n"
         text += f"**Change summary:** {hunk.get('change_summary', 'N/A')}\n"
-        if include_code and hunk.get("deobfuscated_code"):
-            text += f"**Deobfuscated code:**\n```\n{hunk['deobfuscated_code']}\n```\n"
+        key_ids = hunk.get("key_identifiers")
+        if include_code and key_ids:
+            mappings = ", ".join(f"`{k}` = {v}" for k, v in key_ids.items())
+            text += f"**Key identifiers:** {mappings}\n"
     return text
 
 
@@ -1652,7 +1816,7 @@ Write in markdown format."""
         return f"# Summary Generation Failed\n\nUnexpected error: {e}"
 
 
-def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="opus", voice_profile=None):
+def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="sonnet", voice_profile=None):
     """Orchestrate Claude analysis of all changed hunks.
 
     Manages progress tracking, per-hunk analysis, and final summary generation.
@@ -1662,7 +1826,7 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
         workdir: Path to working directory
         old_tag: Old release tag
         new_tag: New release tag
-        summary_model: Model to use for final summary (default: opus)
+        summary_model: Model to use for final summary (default: sonnet)
         voice_profile: Optional voice profile text for styling the summary
     """
     workdir = Path(workdir)
@@ -1788,46 +1952,67 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
     if already_done:
         print(f"  Skipping {already_done} already-completed hunks")
 
+    # Group tasks into batches (consecutive same-file hunks)
+    batches = _batch_hunk_tasks(tasks_to_run)
     completed = 0
     remaining = len(tasks_to_run)
-    for task in tasks_to_run:
-        completed += 1
-        tier_label = f" [{task['tier']}]" if task["tier"] != "direct" else ""
-        size_label = f" (preprocessed from {task['original_size']} chars)" if task["original_size"] > HUNK_SIZE_THRESHOLD else ""
-        print(f"  [{completed}/{remaining}] Analyzing {task['file']} hunk {task['progress_key']}{tier_label}{size_label}...")
+    progress_lock = threading.Lock()
+    max_workers = 4
 
-        result = analyze_hunk_with_claude(
-            task["content"], task["file"], task["string_changes"],
-            tier=task["tier"]
-        )
-
-        # On failure for oversized hunks, try Tier 3 string fallback
-        if result.get("error") and task["original_size"] > HUNK_SIZE_THRESHOLD and task["tier"] != "string_fallback":
-            print(f"    Tier {task['tier']} failed, falling back to string analysis...")
-            fallback_content = build_string_fallback_content(
-                task["content"],
-                task["string_changes"].get("new_strings", []),
-                task["string_changes"].get("removed_strings", []),
+    def _run_batch(batch, batch_idx):
+        """Execute a single batch and return (batch_idx, results)."""
+        if len(batch) == 1:
+            task = batch[0]
+            result = analyze_hunk_with_claude(
+                task["content"], task["file"], task["string_changes"],
+                tier=task["tier"]
             )
-            if fallback_content.strip():
-                result = analyze_hunk_with_claude(
-                    fallback_content, task["file"], task["string_changes"],
-                    tier="string_fallback"
-                )
+            return batch_idx, [(task, result)]
+        else:
+            return batch_idx, analyze_hunk_batch_with_claude(batch)
 
-        hunk_entry = {
-            "file": task["file"],
-            "hunk_index": task["hunk_index"],
-            "progress_key": task["progress_key"],
-            "hunk_header": task["hunk_header"],
-            "tier": task["tier"],
-            "original_size": task["original_size"],
-            "status": "completed",
-            "result": result,
-        }
-        progress["hunks"].append(hunk_entry)
-        progress["completed_hunks"] = already_done + completed
-        progress_path.write_text(json.dumps(progress, indent=2))
+    print(f"  Processing {len(batches)} batches with {max_workers} workers...")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for batch_idx, batch in enumerate(batches):
+            if len(batch) == 1:
+                task = batch[0]
+                tier_label = f" [{task['tier']}]" if task["tier"] != "direct" else ""
+                size_label = f" (preprocessed from {task['original_size']} chars)" if task["original_size"] > HUNK_SIZE_THRESHOLD else ""
+                print(f"  Queued: {task['file']} hunk {task['progress_key']}{tier_label}{size_label}")
+            else:
+                keys = ", ".join(t["progress_key"] for t in batch)
+                print(f"  Queued batch: {batch[0]['file']} hunks {keys}")
+            future = executor.submit(_run_batch, batch, batch_idx)
+            futures[future] = batch
+
+        for future in as_completed(futures):
+            batch = futures[future]
+            try:
+                _batch_idx, batch_results = future.result()
+            except Exception as e:
+                # If the entire batch call raised, record errors for all tasks
+                error_stub = {"description": "", "change_summary": "", "key_identifiers": {}}
+                batch_results = [(t, {"error": f"Batch execution failed: {e}", **error_stub}) for t in batch]
+
+            with progress_lock:
+                for task, result in batch_results:
+                    hunk_entry = {
+                        "file": task["file"],
+                        "hunk_index": task["hunk_index"],
+                        "progress_key": task["progress_key"],
+                        "hunk_header": task["hunk_header"],
+                        "tier": task["tier"],
+                        "original_size": task["original_size"],
+                        "status": "completed",
+                        "result": result,
+                    }
+                    progress["hunks"].append(hunk_entry)
+                    completed += 1
+
+                progress["completed_hunks"] = already_done + completed
+                progress_path.write_text(json.dumps(progress, indent=2))
+                print(f"  [{completed}/{remaining}] hunks complete")
 
     progress["status"] = "analysis_complete"
     progress_path.write_text(json.dumps(progress, indent=2))
@@ -1879,8 +2064,8 @@ def main():
                         help="Path to a local AppImage for the new version (skip download)")
     parser.add_argument("--no-analyze", action="store_true",
                         help="Skip Claude-powered analysis step (produce only raw reports)")
-    parser.add_argument("--model", default="opus",
-                        help="Model for summary generation (default: opus)")
+    parser.add_argument("--model", default="sonnet",
+                        help="Model for summary generation (default: sonnet)")
     parser.add_argument("--voice-profile-url",
                         help="URL to a voice profile .md file for styling the summary")
     args = parser.parse_args()
