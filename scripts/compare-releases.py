@@ -81,12 +81,15 @@ class TokenTracker:
             lines.append(f"  Total cost: ${total_cost:.4f}")
             return "\n".join(lines)
 
-    def summary_markdown(self):
+    def summary_markdown(self, duration_secs=None):
         """Return a markdown-formatted table of token usage for inclusion in reports."""
         with self._lock:
             if not self._usage:
                 return ""
             lines = ["\n\n---\n", "### Analysis Cost", ""]
+            if duration_secs is not None:
+                mins, secs = divmod(int(duration_secs), 60)
+                lines.append(f"**Duration:** {mins}m {secs}s\n")
             lines.append("| Model | Calls | Input | Cache Read | Cache Write | Output | Cost |")
             lines.append("|-------|------:|------:|-----------:|------------:|-------:|-----:|")
             total_cost = 0.0
@@ -1845,6 +1848,7 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
     global _cli_log_workdir
     workdir = Path(workdir)
     _cli_log_workdir = workdir
+    analysis_start_time = time.time()
     progress_path = workdir / "analysis-progress.json"
     summary_path = workdir / "summary.md"
     use_difft = get_has_difft()
@@ -2052,7 +2056,8 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
     print(f"\n  Generating summary with {summary_model}...")
     summary = generate_summary_with_claude(all_analyses, old_tag, new_tag, model=summary_model, voice_profile=voice_profile)
 
-    cost_section = token_tracker.summary_markdown()
+    analysis_duration = time.time() - analysis_start_time
+    cost_section = token_tracker.summary_markdown(duration_secs=analysis_duration)
     summary_path.write_text(summary + cost_section)
     progress["status"] = "completed"
     progress_path.write_text(json.dumps(progress, indent=2))
