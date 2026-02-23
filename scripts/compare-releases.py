@@ -82,24 +82,43 @@ class TokenTracker:
             return "\n".join(lines)
 
     def summary_markdown(self):
-        """Return a markdown-formatted summary for inclusion in reports."""
+        """Return a markdown-formatted table of token usage for inclusion in reports."""
         with self._lock:
             if not self._usage:
                 return ""
-            lines = ["\n---\n", "### Analysis Cost"]
+            lines = ["\n---\n", "### Analysis Cost", ""]
+            lines.append("| Model | Calls | Input | Cache Read | Cache Write | Output | Cost |")
+            lines.append("|-------|------:|------:|-----------:|------------:|-------:|-----:|")
             total_cost = 0.0
+            total_calls = 0
+            total_input = 0
+            total_cache_read = 0
+            total_cache_write = 0
+            total_output = 0
             for model_id in sorted(self._usage):
                 u = self._usage[model_id]
                 total_cost += u["costUSD"]
+                total_calls += u["calls"]
+                total_input += u["inputTokens"]
+                total_cache_read += u["cacheReadInputTokens"]
+                total_cache_write += u["cacheCreationInputTokens"]
+                total_output += u["outputTokens"]
                 lines.append(
-                    f"- **{model_id}**: {u['calls']} calls — "
-                    f"{u['inputTokens']:,} input, "
-                    f"{u['cacheReadInputTokens']:,} cache-read, "
-                    f"{u['cacheCreationInputTokens']:,} cache-write, "
-                    f"{u['outputTokens']:,} output "
-                    f"(${u['costUSD']:.4f})"
+                    f"| {model_id} | {u['calls']} | "
+                    f"{u['inputTokens']:,} | "
+                    f"{u['cacheReadInputTokens']:,} | "
+                    f"{u['cacheCreationInputTokens']:,} | "
+                    f"{u['outputTokens']:,} | "
+                    f"${u['costUSD']:.4f} |"
                 )
-            lines.append(f"\n**Total cost: ${total_cost:.4f}**")
+            lines.append(
+                f"| **Total** | **{total_calls}** | "
+                f"**{total_input:,}** | "
+                f"**{total_cache_read:,}** | "
+                f"**{total_cache_write:,}** | "
+                f"**{total_output:,}** | "
+                f"**${total_cost:.4f}** |"
+            )
             return "\n".join(lines)
 
 
