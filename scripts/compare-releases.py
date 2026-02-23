@@ -1371,6 +1371,18 @@ def _extract_wait_time(result):
     return RATE_LIMIT_BASE_WAIT
 
 
+def _cli_log(workdir, msg):
+    """Append a timestamped message to the CLI debug log."""
+    log_path = Path(workdir) / "cli-debug.log" if workdir else Path("cli-debug.log")
+    timestamp = time.strftime("%H:%M:%S")
+    with open(log_path, "a") as f:
+        f.write(f"[{timestamp}] {msg}\n")
+
+
+# Module-level workdir reference for logging (set by run_claude_analysis)
+_cli_log_workdir = None
+
+
 def _run_claude_cli(cmd, input_text, timeout_secs):
     """Run a Claude CLI command with rate limit retry.
 
@@ -1385,12 +1397,34 @@ def _run_claude_cli(cmd, input_text, timeout_secs):
     Raises:
         subprocess.TimeoutExpired if all attempts time out.
     """
+    # Extract model from cmd for logging
+    model = "unknown"
+    for i, arg in enumerate(cmd):
+        if arg == "--model" and i + 1 < len(cmd):
+            model = cmd[i + 1]
+            break
+
+    input_len = len(input_text) if input_text else 0
+    _cli_log(_cli_log_workdir,
+             f"START model={model} input_chars={input_len} timeout={timeout_secs}s")
+
     env = _claude_env()
     for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
-        result = subprocess.run(
-            cmd, input=input_text, capture_output=True, text=True,
-            timeout=timeout_secs, env=env
-        )
+        t0 = time.time()
+        try:
+            result = subprocess.run(
+                cmd, input=input_text, capture_output=True, text=True,
+                timeout=timeout_secs, env=env
+            )
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - t0
+            _cli_log(_cli_log_workdir,
+                     f"TIMEOUT model={model} input_chars={input_len} "
+                     f"elapsed={elapsed:.1f}s timeout={timeout_secs}s attempt={attempt + 1}")
+            if attempt >= RATE_LIMIT_MAX_RETRIES:
+                raise
+            continue
+        elapsed = time.time() - t0
         if result.returncode == 0 or not _is_rate_limited(result):
             # Try to record token usage from JSON responses
             if result.returncode == 0 and result.stdout.strip():
@@ -1398,12 +1432,28 @@ def _run_claude_cli(cmd, input_text, timeout_secs):
                     resp = json.loads(result.stdout)
                     if isinstance(resp, dict):
                         token_tracker.record(resp)
+                        api_ms = resp.get("duration_api_ms", "?")
+                        _cli_log(_cli_log_workdir,
+                                 f"OK model={model} elapsed={elapsed:.1f}s "
+                                 f"api_ms={api_ms} input_chars={input_len} "
+                                 f"stdout_len={len(result.stdout)}")
                 except (json.JSONDecodeError, ValueError):
-                    pass  # non-JSON output, skip tracking
+                    _cli_log(_cli_log_workdir,
+                             f"OK model={model} elapsed={elapsed:.1f}s "
+                             f"input_chars={input_len} (non-JSON response)")
+            if result.returncode != 0:
+                _cli_log(_cli_log_workdir,
+                         f"FAIL model={model} rc={result.returncode} "
+                         f"elapsed={elapsed:.1f}s input_chars={input_len} "
+                         f"stderr={result.stderr[:300]}")
+                print(f"    CLI failed (rc={result.returncode}) after {elapsed:.1f}s: {result.stderr[:200]}")
             return result
         wait = _extract_wait_time(result) + 10  # small buffer
+        _cli_log(_cli_log_workdir,
+                 f"RATE_LIMITED model={model} elapsed={elapsed:.1f}s "
+                 f"attempt={attempt + 1} wait={wait}s")
         if attempt < RATE_LIMIT_MAX_RETRIES:
-            print(f"    Rate limited. Waiting {wait}s before retry ({attempt + 1}/{RATE_LIMIT_MAX_RETRIES})...")
+            print(f"    Rate limited after {elapsed:.1f}s. Waiting {wait}s before retry ({attempt + 1}/{RATE_LIMIT_MAX_RETRIES})...")
             time.sleep(wait)
     return result  # return last attempt's result
 
@@ -1450,7 +1500,7 @@ HUNK_ANALYSIS_SCHEMA = json.dumps({
 })
 
 
-def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="haiku", tier="direct"):
+def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="sonnet", tier="direct"):
     """Analyze a single diff hunk using Claude CLI.
 
     Args:
@@ -1541,6 +1591,9 @@ The code has been beautified but identifiers are still minified (single letters,
 Return your analysis as JSON."""
 
     error_stub = {"description": "", "change_summary": "", "key_identifiers": {}}
+    _cli_log(_cli_log_workdir,
+             f"HUNK_SINGLE file={file_path} tier={tier} "
+             f"hunk_chars={len(hunk_content)} prompt_chars={len(prompt)}")
     try:
         result = _run_claude_cli(
             ["claude", "-p", "--model", model,
@@ -1555,6 +1608,9 @@ Return your analysis as JSON."""
         return _extract_structured_output(response)
 
     except subprocess.TimeoutExpired:
+        _cli_log(_cli_log_workdir,
+                 f"HUNK_TIMEOUT file={file_path} tier={tier} "
+                 f"hunk_chars={len(hunk_content)} prompt_chars={len(prompt)}")
         return {"error": "Claude CLI timed out", **error_stub}
     except (json.JSONDecodeError, KeyError) as e:
         return {"error": f"Failed to parse Claude response: {e}", **error_stub}
@@ -1626,7 +1682,7 @@ def _batch_hunk_tasks(tasks, max_batch_chars=30000):
     return batches
 
 
-def analyze_hunk_batch_with_claude(batch, model="haiku"):
+def analyze_hunk_batch_with_claude(batch, model="sonnet"):
     """Analyze multiple hunks from the same file in a single Claude call.
 
     Args:
@@ -1684,13 +1740,17 @@ For EACH hunk above, provide:
 Return a JSON array with one object per hunk, in the same order. Each object must include `hunk_index` (1-based)."""
 
     error_stub = {"description": "", "change_summary": "", "key_identifiers": {}}
+    batch_keys = ", ".join(t["progress_key"] for t in batch)
+    _cli_log(_cli_log_workdir,
+             f"HUNK_BATCH file={file_path} hunks=[{batch_keys}] "
+             f"batch_size={len(batch)} prompt_chars={len(prompt)}")
 
     try:
         result = _run_claude_cli(
             ["claude", "-p", "--model", model,
              "--output-format", "json", "--json-schema", HUNK_BATCH_SCHEMA,
              "--dangerously-skip-permissions"],
-            input_text=prompt, timeout_secs=180
+            input_text=prompt, timeout_secs=1200
         )
         if result.returncode != 0:
             return [(task, {"error": f"Claude CLI failed: {result.stderr[:500]}", **error_stub}) for task in batch]
@@ -1714,6 +1774,9 @@ Return a JSON array with one object per hunk, in the same order. Each object mus
         return results
 
     except subprocess.TimeoutExpired:
+        _cli_log(_cli_log_workdir,
+                 f"BATCH_TIMEOUT file={file_path} hunks=[{batch_keys}] "
+                 f"prompt_chars={len(prompt)}")
         return [(task, {"error": "Claude CLI timed out", **error_stub}) for task in batch]
     except (json.JSONDecodeError, KeyError) as e:
         return [(task, {"error": f"Failed to parse Claude response: {e}", **error_stub}) for task in batch]
@@ -1926,10 +1989,18 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
         summary_model: Model to use for final summary (default: sonnet)
         voice_profile: Optional voice profile text for styling the summary
     """
+    global _cli_log_workdir
     workdir = Path(workdir)
+    _cli_log_workdir = workdir
     progress_path = workdir / "analysis-progress.json"
     summary_path = workdir / "summary.md"
     use_difft = get_has_difft()
+
+    # Clear previous debug log
+    log_path = workdir / "cli-debug.log"
+    if log_path.exists():
+        log_path.unlink()
+    _cli_log(workdir, "=== Analysis started ===")
 
     # Load existing progress for resume support
     progress = {"status": "in_progress", "total_hunks": 0, "completed_hunks": 0, "hunks": []}
@@ -2049,51 +2120,39 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
     if already_done:
         print(f"  Skipping {already_done} already-completed hunks")
 
-    # Group tasks into batches (consecutive same-file hunks)
-    batches = _batch_hunk_tasks(tasks_to_run)
     completed = 0
     remaining = len(tasks_to_run)
     progress_lock = threading.Lock()
     max_workers = 4
 
-    def _run_batch(batch, batch_idx):
-        """Execute a single batch and return (batch_idx, results)."""
-        if len(batch) == 1:
-            task = batch[0]
-            result = analyze_hunk_with_claude(
-                task["content"], task["file"], task["string_changes"],
-                tier=task["tier"]
-            )
-            return batch_idx, [(task, result)]
-        else:
-            return batch_idx, analyze_hunk_batch_with_claude(batch)
+    def _run_single(task, task_idx):
+        """Execute a single hunk analysis and return (task_idx, task, result)."""
+        result = analyze_hunk_with_claude(
+            task["content"], task["file"], task["string_changes"],
+            tier=task["tier"]
+        )
+        return task_idx, task, result
 
-    print(f"  Processing {len(batches)} batches with {max_workers} workers...")
+    print(f"  Processing {remaining} hunks with {max_workers} workers...")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
-        for batch_idx, batch in enumerate(batches):
-            if len(batch) == 1:
-                task = batch[0]
-                tier_label = f" [{task['tier']}]" if task["tier"] != "direct" else ""
-                size_label = f" (preprocessed from {task['original_size']} chars)" if task["original_size"] > HUNK_SIZE_THRESHOLD else ""
-                print(f"  Queued: {task['file']} hunk {task['progress_key']}{tier_label}{size_label}")
-            else:
-                keys = ", ".join(t["progress_key"] for t in batch)
-                print(f"  Queued batch: {batch[0]['file']} hunks {keys}")
-            future = executor.submit(_run_batch, batch, batch_idx)
-            futures[future] = batch
+        for task_idx, task in enumerate(tasks_to_run):
+            tier_label = f" [{task['tier']}]" if task["tier"] != "direct" else ""
+            size_label = f" (preprocessed from {task['original_size']} chars)" if task["original_size"] > HUNK_SIZE_THRESHOLD else ""
+            print(f"  Queued: {task['file']} hunk {task['progress_key']}{tier_label}{size_label}")
+            future = executor.submit(_run_single, task, task_idx)
+            futures[future] = task
 
         for future in as_completed(futures):
-            batch = futures[future]
+            task = futures[future]
             try:
-                _batch_idx, batch_results = future.result()
+                _task_idx, task, result = future.result()
             except Exception as e:
-                # If the entire batch call raised, record errors for all tasks
                 error_stub = {"description": "", "change_summary": "", "key_identifiers": {}}
-                batch_results = [(t, {"error": f"Batch execution failed: {e}", **error_stub}) for t in batch]
+                result = {"error": f"Execution failed: {e}", **error_stub}
 
             with progress_lock:
-                for task, result in batch_results:
+                for task, result in [(task, result)]:
                     hunk_entry = {
                         "file": task["file"],
                         "hunk_index": task["hunk_index"],
