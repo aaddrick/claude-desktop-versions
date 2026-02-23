@@ -86,7 +86,7 @@ class TokenTracker:
         with self._lock:
             if not self._usage:
                 return ""
-            lines = ["\n---\n", "### Analysis Cost", ""]
+            lines = ["\n\n---\n", "### Analysis Cost", ""]
             lines.append("| Model | Calls | Input | Cache Read | Cache Write | Output | Cost |")
             lines.append("|-------|------:|------:|-----------:|------------:|-------:|-----:|")
             total_cost = 0.0
