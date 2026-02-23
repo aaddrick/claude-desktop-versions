@@ -27,6 +27,85 @@ from pathlib import Path
 
 REPO = "aaddrick/claude-desktop-debian"
 
+
+class TokenTracker:
+    """Thread-safe tracker for Claude API token usage per model."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._usage = {}  # model_id -> {inputTokens, outputTokens, cacheRead, cacheCreation, costUSD, calls}
+
+    def record(self, response_json):
+        """Extract and record token usage from a Claude CLI JSON response."""
+        model_usage = response_json.get("modelUsage", {})
+        if not model_usage:
+            return
+        with self._lock:
+            for model_id, usage in model_usage.items():
+                if model_id not in self._usage:
+                    self._usage[model_id] = {
+                        "inputTokens": 0,
+                        "outputTokens": 0,
+                        "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 0,
+                        "costUSD": 0.0,
+                        "calls": 0,
+                    }
+                entry = self._usage[model_id]
+                entry["inputTokens"] += usage.get("inputTokens", 0)
+                entry["outputTokens"] += usage.get("outputTokens", 0)
+                entry["cacheReadInputTokens"] += usage.get("cacheReadInputTokens", 0)
+                entry["cacheCreationInputTokens"] += usage.get("cacheCreationInputTokens", 0)
+                entry["costUSD"] += usage.get("costUSD", 0.0)
+                entry["calls"] += 1
+
+    def summary(self):
+        """Return a formatted summary string of token usage per model."""
+        with self._lock:
+            if not self._usage:
+                return "  No token usage recorded."
+            lines = []
+            total_cost = 0.0
+            for model_id in sorted(self._usage):
+                u = self._usage[model_id]
+                total_cost += u["costUSD"]
+                lines.append(
+                    f"  {model_id}: "
+                    f"{u['calls']} calls, "
+                    f"{u['inputTokens']:,} input + "
+                    f"{u['cacheReadInputTokens']:,} cache-read + "
+                    f"{u['cacheCreationInputTokens']:,} cache-write + "
+                    f"{u['outputTokens']:,} output tokens "
+                    f"(${u['costUSD']:.4f})"
+                )
+            lines.append(f"  Total cost: ${total_cost:.4f}")
+            return "\n".join(lines)
+
+    def summary_markdown(self):
+        """Return a markdown-formatted summary for inclusion in reports."""
+        with self._lock:
+            if not self._usage:
+                return ""
+            lines = ["\n---\n", "### Analysis Cost"]
+            total_cost = 0.0
+            for model_id in sorted(self._usage):
+                u = self._usage[model_id]
+                total_cost += u["costUSD"]
+                lines.append(
+                    f"- **{model_id}**: {u['calls']} calls — "
+                    f"{u['inputTokens']:,} input, "
+                    f"{u['cacheReadInputTokens']:,} cache-read, "
+                    f"{u['cacheCreationInputTokens']:,} cache-write, "
+                    f"{u['outputTokens']:,} output "
+                    f"(${u['costUSD']:.4f})"
+                )
+            lines.append(f"\n**Total cost: ${total_cost:.4f}**")
+            return "\n".join(lines)
+
+
+# Global token tracker instance
+token_tracker = TokenTracker()
+
 # Regex to strip Vite content hashes from filenames
 # Matches patterns like "main-DW5TxSpY.js" -> "main.js"
 VITE_HASH_RE = re.compile(r"-[A-Za-z0-9_-]{6,12}(\.\w+)$")
@@ -1313,6 +1392,14 @@ def _run_claude_cli(cmd, input_text, timeout_secs):
             timeout=timeout_secs, env=env
         )
         if result.returncode == 0 or not _is_rate_limited(result):
+            # Try to record token usage from JSON responses
+            if result.returncode == 0 and result.stdout.strip():
+                try:
+                    resp = json.loads(result.stdout)
+                    if isinstance(resp, dict):
+                        token_tracker.record(resp)
+                except (json.JSONDecodeError, ValueError):
+                    pass  # non-JSON output, skip tracking
             return result
         wait = _extract_wait_time(result) + 10  # small buffer
         if attempt < RATE_LIMIT_MAX_RETRIES:
@@ -1459,7 +1546,7 @@ Return your analysis as JSON."""
             ["claude", "-p", "--model", model,
              "--output-format", "json", "--json-schema", HUNK_ANALYSIS_SCHEMA,
              "--dangerously-skip-permissions"],
-            input_text=prompt, timeout_secs=120
+            input_text=prompt, timeout_secs=1200
         )
         if result.returncode != 0:
             return {"error": f"Claude CLI failed: {result.stderr[:500]}", **error_stub}
@@ -1672,12 +1759,17 @@ Focus on functional/behavioral changes, not minified name shuffles. Omit hunks t
 
     try:
         result = _run_claude_cli(
-            ["claude", "-p", "--model", model, "--dangerously-skip-permissions"],
+            ["claude", "-p", "--model", model, "--output-format", "json",
+             "--dangerously-skip-permissions"],
             input_text=prompt, timeout_secs=180
         )
         if result.returncode != 0:
             return f"- {file_path}: summary failed ({result.stderr[:200]})"
-        return result.stdout
+        try:
+            resp = json.loads(result.stdout)
+            return resp.get("result", result.stdout)
+        except (json.JSONDecodeError, ValueError):
+            return result.stdout
     except subprocess.TimeoutExpired:
         return f"- {file_path}: summary timed out"
     except Exception as e:
@@ -1803,12 +1895,17 @@ Write in markdown format."""
 
     try:
         result = _run_claude_cli(
-            ["claude", "-p", "--model", model, "--dangerously-skip-permissions"],
+            ["claude", "-p", "--model", model, "--output-format", "json",
+             "--dangerously-skip-permissions"],
             input_text=prompt, timeout_secs=300
         )
         if result.returncode != 0:
             return f"# Summary Generation Failed\n\nClaude CLI error: {result.stderr[:1000]}"
-        return result.stdout
+        try:
+            resp = json.loads(result.stdout)
+            return resp.get("result", result.stdout)
+        except (json.JSONDecodeError, ValueError):
+            return result.stdout
 
     except subprocess.TimeoutExpired:
         return "# Summary Generation Failed\n\nClaude CLI timed out during summary generation."
@@ -2043,11 +2140,16 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
     print(f"\n  Generating summary with {summary_model}...")
     summary = generate_summary_with_claude(all_analyses, old_tag, new_tag, model=summary_model, voice_profile=voice_profile)
 
-    summary_path.write_text(summary)
+    cost_section = token_tracker.summary_markdown()
+    summary_path.write_text(summary + cost_section)
     progress["status"] = "completed"
     progress_path.write_text(json.dumps(progress, indent=2))
 
     print(f"  Summary written to {summary_path}")
+
+    # Print token usage summary
+    print("\n  === Token Usage by Model ===")
+    print(token_tracker.summary())
 
 
 def main():
