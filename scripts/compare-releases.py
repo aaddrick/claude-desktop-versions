@@ -1699,7 +1699,30 @@ Focus on functional/behavioral changes, not minified name shuffles. Omit hunks t
 _SUMMARY_SINGLE_STAGE_LIMIT = 100000
 
 
-def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus", voice_profile=None):
+def fetch_previous_release_notes(tag):
+    """Fetch release notes for a previous tag from GitHub.
+
+    Returns the release body text with the cost/analysis section stripped,
+    or None if the release doesn't exist or gh is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "release", "view", tag, "--repo", REPO, "--json", "body", "--jq", ".body"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return None
+        body = result.stdout.strip()
+        if not body:
+            return None
+        # Strip the "Analysis Cost" section (not useful for dedup)
+        body = re.split(r'\n---\n\n\*\*Analysis Cost', body, maxsplit=1)[0]
+        return body.strip() or None
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        return None
+
+
+def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus", voice_profile=None, previous_notes=None):
     """Generate a cohesive summary from all per-hunk analyses using Claude.
 
     For small diffs, sends all analyses in one prompt. For large diffs
@@ -1712,6 +1735,7 @@ def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus", v
         new_tag: New release tag
         model: Claude model to use (default: opus)
         voice_profile: Optional voice profile text for styling the summary
+        previous_notes: Optional previous release notes for dedup
 
     Returns:
         Summary markdown string.
@@ -1728,7 +1752,7 @@ def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus", v
 
     # If the analysis text is small enough, use single-stage summary
     if len(analysis_text) <= _SUMMARY_SINGLE_STAGE_LIMIT:
-        return _generate_final_summary(analysis_text, old_tag, new_tag, model, voice_profile)
+        return _generate_final_summary(analysis_text, old_tag, new_tag, model, voice_profile, previous_notes)
 
     # Two-stage summary: per-file first, then combine
     print("    Analysis too large for single prompt, using two-stage summary...")
@@ -1757,10 +1781,10 @@ def generate_summary_with_claude(all_analyses, old_tag, new_tag, model="opus", v
     if len(combined) > _SUMMARY_SINGLE_STAGE_LIMIT:
         combined = combined[:_SUMMARY_SINGLE_STAGE_LIMIT] + "\n\n... [remaining file summaries truncated] ...\n"
 
-    return _generate_final_summary(combined, old_tag, new_tag, model, voice_profile)
+    return _generate_final_summary(combined, old_tag, new_tag, model, voice_profile, previous_notes)
 
 
-def _generate_final_summary(analysis_text, old_tag, new_tag, model, voice_profile=None):
+def _generate_final_summary(analysis_text, old_tag, new_tag, model, voice_profile=None, previous_notes=None):
     """Generate the final summary from (possibly pre-summarized) analysis text."""
     voice_section = ""
     if voice_profile:
@@ -1775,6 +1799,19 @@ and structural patterns. The voice is friendly, direct, and technically competen
 </voice-profile>
 """
 
+    previous_notes_section = ""
+    if previous_notes:
+        previous_notes_section = f"""
+## Previous Release Notes
+The following changes were already announced in the previous release ({old_tag}).
+Do NOT repeat any of these items. Only describe changes that are NEW in this release.
+
+<previous-release-notes>
+{previous_notes}
+</previous-release-notes>
+
+"""
+
     prompt = f"""You are summarizing the changes between two releases of Claude Desktop, an Electron application.
 
 **Old release:** {old_tag}
@@ -1784,8 +1821,7 @@ Below are per-hunk analyses of every changed code section. Each hunk has been in
 to deobfuscate minified names and describe what changed.
 
 {analysis_text}
-
-## Instructions
+{previous_notes_section}## Instructions
 Write a concise release notes summary. Focus on changes that matter to users and developers.
 
 **Skip mundane/routine items entirely** — do NOT include:
@@ -1832,7 +1868,7 @@ Write in markdown format."""
         return f"# Summary Generation Failed\n\nUnexpected error: {e}"
 
 
-def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="sonnet", voice_profile=None):
+def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="opus", voice_profile=None):
     """Orchestrate Claude analysis of all changed hunks.
 
     Manages progress tracking, per-hunk analysis, and final summary generation.
@@ -2052,9 +2088,16 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
 
     all_analyses = sorted(file_analyses.values(), key=lambda x: x["file"])
 
+    # Fetch previous release notes for dedup
+    previous_notes = fetch_previous_release_notes(old_tag)
+    if previous_notes:
+        print(f"  Fetched previous release notes for dedup ({len(previous_notes)} chars)")
+    else:
+        print("  No previous release notes found (new items won't be deduped)")
+
     # Generate summary
     print(f"\n  Generating summary with {summary_model}...")
-    summary = generate_summary_with_claude(all_analyses, old_tag, new_tag, model=summary_model, voice_profile=voice_profile)
+    summary = generate_summary_with_claude(all_analyses, old_tag, new_tag, model=summary_model, voice_profile=voice_profile, previous_notes=previous_notes)
 
     analysis_duration = time.time() - analysis_start_time
     cost_section = token_tracker.summary_markdown(duration_secs=analysis_duration)
@@ -2083,8 +2126,8 @@ def main():
                         help="Path to a local AppImage for the new version (skip download)")
     parser.add_argument("--no-analyze", action="store_true",
                         help="Skip Claude-powered analysis step (produce only raw reports)")
-    parser.add_argument("--model", default="sonnet",
-                        help="Model for summary generation (default: sonnet)")
+    parser.add_argument("--model", default="opus",
+                        help="Model for summary generation (default: opus)")
     parser.add_argument("--voice-profile-url",
                         help="URL to a voice profile .md file for styling the summary")
     args = parser.parse_args()
