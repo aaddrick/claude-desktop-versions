@@ -1522,14 +1522,14 @@ HUNK_ANALYSIS_SCHEMA = json.dumps({
 })
 
 
-def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="haiku", tier="direct"):
+def analyze_hunk_with_claude(hunk_content, file_path, string_changes, model="sonnet", tier="direct"):
     """Analyze a single diff hunk using Claude CLI.
 
     Args:
         hunk_content: The diff hunk text
         file_path: Path of the file being analyzed
         string_changes: Dict with 'new_strings' and 'removed_strings' for context
-        model: Claude model to use (default: haiku)
+        model: Claude model to use (default: sonnet)
         tier: Analysis tier - "direct", "subline", or "string_fallback"
 
     Returns:
