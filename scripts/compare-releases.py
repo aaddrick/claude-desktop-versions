@@ -127,6 +127,53 @@ class TokenTracker:
             return "\n".join(lines)
 
 
+def _install_instructions_markdown():
+    """Return markdown install instructions for inclusion in release notes."""
+    return """
+
+---
+
+### Installation
+
+#### APT (Debian/Ubuntu - Recommended)
+
+```bash
+# Add the GPG key
+curl -fsSL https://aaddrick.github.io/claude-desktop-debian/KEY.gpg | sudo gpg --dearmor -o /usr/share/keyrings/claude-desktop.gpg
+
+# Add the repository
+echo "deb [signed-by=/usr/share/keyrings/claude-desktop.gpg arch=amd64,arm64] https://aaddrick.github.io/claude-desktop-debian stable main" | sudo tee /etc/apt/sources.list.d/claude-desktop.list
+
+# Update and install
+sudo apt update
+sudo apt install claude-desktop
+```
+
+#### DNF (Fedora/RHEL - Recommended)
+
+```bash
+# Add the repository
+sudo curl -fsSL https://aaddrick.github.io/claude-desktop-debian/rpm/claude-desktop.repo -o /etc/yum.repos.d/claude-desktop.repo
+
+# Install
+sudo dnf install claude-desktop
+```
+
+#### AUR (Arch Linux)
+
+```bash
+# Using yay
+yay -S claude-desktop-appimage
+
+# Or using paru
+paru -S claude-desktop-appimage
+```
+
+#### Pre-built Releases
+
+Download the latest `.deb`, `.rpm`, or `.AppImage` from the [Releases page](https://github.com/aaddrick/claude-desktop-debian/releases)."""
+
+
 # Global token tracker instance
 token_tracker = TokenTracker()
 
@@ -1842,9 +1889,10 @@ Write a concise release notes summary. Focus on changes that matter to users and
 - CSS/UI changes that affect what users see
 
 Structure the summary with:
-1. A brief overview (2-3 sentences) of the highlights
-2. Sections for notable changes, grouped naturally (features, fixes, dependency updates, etc.)
-3. Keep descriptions clear and practical — explain what changed and why it matters
+1. Start with a H2 heading: ## {old_tag} → {new_tag}
+2. A brief overview (2-3 sentences) of the highlights
+3. Sections for notable changes, grouped naturally (features, fixes, dependency updates, etc.)
+4. Keep descriptions clear and practical — explain what changed and why it matters
 
 Do NOT include a confidence assessment table. If you're unsure about something, note it inline.
 {voice_section}
@@ -2102,8 +2150,9 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
     summary = generate_summary_with_claude(all_analyses, old_tag, new_tag, model=summary_model, voice_profile=voice_profile, previous_notes=previous_notes)
 
     analysis_duration = time.time() - analysis_start_time
+    install_section = _install_instructions_markdown()
     cost_section = token_tracker.summary_markdown(duration_secs=analysis_duration)
-    summary_path.write_text(summary + cost_section)
+    summary_path.write_text(summary + install_section + cost_section)
     progress["status"] = "completed"
     progress_path.write_text(json.dumps(progress, indent=2))
 
