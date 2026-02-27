@@ -122,6 +122,8 @@ class TokenTracker:
                 f"**{total_output:,}** | "
                 f"**${total_cost:.4f}** |"
             )
+            lines.append("")
+            lines.append("*Like this project? [Consider sponsoring!](https://github.com/sponsors/aaddrick)*")
             return "\n".join(lines)
 
 
