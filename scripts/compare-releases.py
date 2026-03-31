@@ -847,7 +847,10 @@ def _ts_analyze_file(old_path, new_path, rel_label):
         "status": "modified",
         "analysis_mode": "treesitter",
         "unchanged_count": match_result["unchanged"],
-        "content_modified": match_result["content_modified"],
+        "content_modified": [
+            {**cm, "old_strings": sorted(cm["old_strings"]), "new_strings": sorted(cm["new_strings"])}
+            for cm in match_result["content_modified"]
+        ],
         "added_declarations": added_previews,
         "removed_declarations": removed_previews,
         "new_strings": sorted(new_strings - old_strings),
@@ -911,6 +914,22 @@ def analyze_changes(old_dir, new_dir, added, removed, modified, renamed):
 
 def _render_file_report_md(fr, lines):
     """Render a single file report entry into markdown lines."""
+    # Tree-sitter structural summary
+    if fr.get("analysis_mode") == "treesitter":
+        unchanged = fr.get("unchanged_count", 0)
+        added_decls = fr.get("added_declarations", [])
+        removed_decls = fr.get("removed_declarations", [])
+        content_mod = fr.get("content_modified", [])
+        lines.append(f"**Analysis:** tree-sitter structural comparison")
+        lines.append(f"- Unchanged declarations: {unchanged}")
+        if content_mod:
+            lines.append(f"- Content-modified: {len(content_mod)} groups")
+        if added_decls:
+            lines.append(f"- Added: {len(added_decls)} declarations ({sum(d['size'] for d in added_decls) / 1024:.0f} KB)")
+        if removed_decls:
+            lines.append(f"- Removed: {len(removed_decls)} declarations ({sum(d['size'] for d in removed_decls) / 1024:.0f} KB)")
+        lines.append("")
+
     new_strings = fr.get("new_strings", [])
     removed_strings = fr.get("removed_strings", [])
 
@@ -947,7 +966,7 @@ def generate_report_md(old_tag, new_tag, added, removed, modified, unchanged, re
     old_rv, old_cv = parse_tag(old_tag)
     new_rv, new_cv = parse_tag(new_tag)
 
-    diff_engine = "difftastic (AST-aware)" if get_has_difft() else "difflib (line-based)"
+    diff_engine = "tree-sitter (structural)" if _use_treesitter else ("difftastic (AST-aware)" if get_has_difft() else "difflib (line-based)")
 
     lines = [
         f"# Release Comparison Report",
@@ -1010,7 +1029,7 @@ def generate_report_json(old_tag, new_tag, added, removed, modified, unchanged, 
             "files_modified": len(modified),
             "files_renamed": len(renamed),
             "files_unchanged": len(unchanged),
-            "diff_engine": "difftastic" if get_has_difft() else "difflib",
+            "diff_engine": "tree-sitter" if _use_treesitter else ("difftastic" if get_has_difft() else "difflib"),
         },
         "added_files": sorted(str(p) for p in added),
         "removed_files": sorted(str(p) for p in removed),
@@ -2631,19 +2650,123 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
         except (json.JSONDecodeError, KeyError):
             progress = {"status": "in_progress", "total_hunks": 0, "completed_hunks": 0, "hunks": []}
 
-    # Build list of all hunks to analyze, with preprocessing for oversized hunks
+    # Build list of all tasks to analyze
     all_hunk_tasks = []
     skipped_files = []
     noise_hunks = 0
+    ts_file_count = 0
+
     for fr in file_reports:
         if fr["status"] not in ("modified", "renamed"):
             continue
+
+        file_path = fr["path"]
+
+        # Tree-sitter path: build declaration-level tasks
+        if fr.get("analysis_mode") == "treesitter":
+            added_decls = fr.get("added_declarations", [])
+            removed_decls = fr.get("removed_declarations", [])
+            content_modified = fr.get("content_modified", [])
+            unchanged_count = fr.get("unchanged_count", 0)
+
+            # Skip if nothing to analyze
+            if not added_decls and not removed_decls and not content_modified:
+                skipped_files.append((file_path, f"no structural changes ({unchanged_count} unchanged)"))
+                continue
+
+            ts_file_count += 1
+
+            # Build prompt chunks from declarations (cap at 40KB per chunk)
+            new_strings = fr.get("new_strings", [])
+            removed_strings = fr.get("removed_strings", [])
+            string_section = ""
+            if new_strings or removed_strings:
+                string_section = "\n## String Changes (for context)\n"
+                if new_strings:
+                    string_section += "New strings:\n" + "\n".join(f"- {s}" for s in new_strings[:30]) + "\n"
+                if removed_strings:
+                    string_section += "Removed strings:\n" + "\n".join(f"- {s}" for s in removed_strings[:30]) + "\n"
+
+            # Build declaration text blocks
+            decl_blocks = []
+            if content_modified:
+                for cm in content_modified:
+                    block = f"### Content-Modified ({cm['type']}, {cm['count']} declarations)\n"
+                    if cm.get("new_strings"):
+                        block += "New strings: " + ", ".join(f'`{s}`' for s in list(cm["new_strings"])[:10]) + "\n"
+                    if cm.get("old_strings"):
+                        block += "Removed strings: " + ", ".join(f'`{s}`' for s in list(cm["old_strings"])[:10]) + "\n"
+                    decl_blocks.append(block)
+
+            for d in added_decls:
+                block = f"### Added: {d['type']}"
+                if d.get("name"):
+                    block += f" `{d['name']}`"
+                block += f" ({d['size']} bytes)\n```javascript\n{d['text']}\n```\n"
+                decl_blocks.append(block)
+
+            for d in removed_decls:
+                block = f"### Removed: {d['type']}"
+                if d.get("name"):
+                    block += f" `{d['name']}`"
+                block += f" ({d['size']} bytes)\n```javascript\n{d['text']}\n```\n"
+                decl_blocks.append(block)
+
+            # Chunk into prompts at ~40KB
+            chunks = []
+            current_chunk = []
+            current_size = 0
+            for block in decl_blocks:
+                if current_size + len(block) > 38000 and current_chunk:
+                    chunks.append("\n".join(current_chunk))
+                    current_chunk = []
+                    current_size = 0
+                current_chunk.append(block)
+                current_size += len(block)
+            if current_chunk:
+                chunks.append("\n".join(current_chunk))
+
+            for chunk_idx, chunk_text in enumerate(chunks):
+                header = f"""You are analyzing structural changes in a file from Claude Desktop (Electron app).
+Tree-sitter AST comparison identified genuine structural changes — declarations
+with identical structure (minified renames only) have been filtered out.
+
+## File: {file_path}
+## Stats: {unchanged_count} unchanged, {len(added_decls)} added, {len(removed_decls)} removed, {len(content_modified)} content-modified
+## Chunk: {chunk_idx + 1}/{len(chunks)}
+{string_section}
+## Declarations
+"""
+                prompt = header + chunk_text + """
+
+## Instructions
+1. Describe what the changed/added/removed code does.
+2. Describe the functional/behavioral delta — what's new, what's gone.
+3. Provide a key_identifiers map of important minified names to guessed meaningful names.
+
+Return your analysis as JSON."""
+
+                sub_key = f"ts-{chunk_idx}"
+                all_hunk_tasks.append({
+                    "file": file_path,
+                    "hunk_index": chunk_idx,
+                    "sub_index": 0,
+                    "progress_key": sub_key,
+                    "hunk_header": f"tree-sitter chunk {chunk_idx + 1}/{len(chunks)}",
+                    "content": prompt,
+                    "tier": "treesitter",
+                    "original_size": len(chunk_text),
+                    "string_changes": {"new_strings": new_strings, "removed_strings": removed_strings},
+                })
+
+            continue
+
+        # Text diff path (existing): build hunk-level tasks
         hunks_text = fr.get("hunks", "")
         if not hunks_text or not hunks_text.strip():
             continue
 
         # Skip binary files
-        file_path = fr["path"]
         first_line = hunks_text.strip().splitlines()[0] if hunks_text.strip() else ""
         if "Binary" in first_line:
             skipped_files.append((file_path, "binary"))
@@ -2697,6 +2820,8 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
                     "string_changes": string_changes,
                 })
 
+    if ts_file_count:
+        print(f"  Tree-sitter analyzed {ts_file_count} JS files")
     if skipped_files:
         print(f"  Skipped {len(skipped_files)} files: {', '.join(f'{f} ({r})' for f, r in skipped_files)}")
     if noise_hunks:
@@ -2733,10 +2858,38 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
 
     def _run_single(task, task_idx):
         """Execute a single hunk analysis and return (task_idx, task, result)."""
-        result = analyze_hunk_with_claude(
-            task["content"], task["file"], task["string_changes"],
-            tier=task["tier"]
-        )
+        if task["tier"] == "treesitter":
+            # Tree-sitter tasks have pre-built prompts — send directly
+            error_stub = {"description": "", "change_summary": "", "key_identifiers": {}}
+            if _use_sdk:
+                try:
+                    resp = _api_call(task["content"], model="sonnet", tool=HUNK_ANALYSIS_TOOL, timeout_secs=1200)
+                    if resp["error"]:
+                        result = {"error": resp["error"], **error_stub}
+                    else:
+                        result = resp["result"]
+                except Exception as e:
+                    result = {"error": f"SDK error: {e}", **error_stub}
+            else:
+                try:
+                    cli_result = _run_claude_cli(
+                        ["claude", "-p", "--model", "sonnet",
+                         "--output-format", "json", "--json-schema", HUNK_ANALYSIS_SCHEMA,
+                         "--dangerously-skip-permissions"],
+                        input_text=task["content"], timeout_secs=1200
+                    )
+                    if cli_result.returncode != 0:
+                        result = {"error": f"CLI failed: {cli_result.stderr[:500]}", **error_stub}
+                    else:
+                        response = json.loads(cli_result.stdout)
+                        result = _extract_structured_output(response)
+                except Exception as e:
+                    result = {"error": f"Error: {e}", **error_stub}
+        else:
+            result = analyze_hunk_with_claude(
+                task["content"], task["file"], task["string_changes"],
+                tier=task["tier"]
+            )
         return task_idx, task, result
 
     print(f"  Processing {remaining} hunks with {max_workers} workers...")
