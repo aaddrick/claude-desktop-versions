@@ -489,18 +489,22 @@ def beautify_js(source_dir):
             return
 
     print(f"  Beautifying {len(js_files)} JS files with prettier...")
+    # Cap Node heap to avoid OOM on large files (confirmed: prettier spikes to 1.8GB uncapped)
+    prettier_env = os.environ.copy()
+    prettier_env["NODE_OPTIONS"] = "--max-old-space-size=512"
     # Run prettier in batches to avoid arg-list-too-long
     batch_size = 50
     for i in range(0, len(js_files), batch_size):
         batch = js_files[i:i + batch_size]
         try:
             run(["npx", "prettier", "--write", "--parser", "babel"] +
-                [str(f) for f in batch])
+                [str(f) for f in batch], env=prettier_env)
         except RuntimeError:
             # Some files may fail to parse; try individually
             for f in batch:
                 try:
-                    run(["npx", "prettier", "--write", "--parser", "babel", str(f)])
+                    run(["npx", "prettier", "--write", "--parser", "babel", str(f)],
+                        env=prettier_env)
                 except RuntimeError:
                     print(f"  Warning: prettier failed on {f.name} ({f.stat().st_size} bytes)")
 
@@ -612,8 +616,39 @@ def extract_strings(text):
     return strings
 
 
+# Threshold above which we use external diff instead of difflib (avoids O(n*m) memory)
+DIFFLIB_SIZE_THRESHOLD = 200_000  # bytes — combined old+new text size
+
+
+def _extract_hunks_external_diff(old_text, new_text, context_lines=5):
+    """Generate unified diff using external diff command (memory-efficient for large files)."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".old", delete=False) as f_old, \
+         tempfile.NamedTemporaryFile(mode="w", suffix=".new", delete=False) as f_new:
+        f_old.write(old_text)
+        f_new.write(new_text)
+        f_old_path, f_new_path = f_old.name, f_new.name
+    try:
+        result = subprocess.run(
+            ["diff", f"-U{context_lines}", "--label", "old", "--label", "new",
+             f_old_path, f_new_path],
+            capture_output=True, text=True
+        )
+        # diff returns 0=identical, 1=different, 2=error
+        if result.returncode == 2:
+            return f"Error running diff: {result.stderr[:500]}"
+        return result.stdout
+    finally:
+        os.unlink(f_old_path)
+        os.unlink(f_new_path)
+
+
 def extract_changed_hunks_difflib(old_text, new_text, context_lines=5):
-    """Generate unified diff hunks using Python's difflib."""
+    """Generate unified diff hunks. Uses external diff for large files to avoid O(n*m) memory."""
+    combined_size = len(old_text) + len(new_text)
+    if combined_size > DIFFLIB_SIZE_THRESHOLD:
+        print(f"    Using external diff for large file ({combined_size / 1024:.0f} KB combined)")
+        return _extract_hunks_external_diff(old_text, new_text, context_lines)
+
     old_lines = old_text.splitlines(keepends=True)
     new_lines = new_text.splitlines(keepends=True)
 
