@@ -36,6 +36,15 @@ try:
 except ImportError:
     HAS_SDK = False
 
+# Tree-sitter (optional — falls back to text diff if unavailable)
+try:
+    import tree_sitter_javascript as _tsjs
+    from tree_sitter import Language as _TsLanguage, Parser as _TsParser
+    _ts_parser = _TsParser(_TsLanguage(_tsjs.language()))
+    HAS_TREESITTER = True
+except ImportError:
+    HAS_TREESITTER = False
+
 # Model pricing for cost calculation (USD per million tokens)
 # SDK doesn't provide costUSD like CLI does, so we compute it
 MODEL_PRICING = {
@@ -772,6 +781,85 @@ def _analyze_file_pair(old_path, new_path, rel_label, suffix):
     return report
 
 
+def _ts_analyze_file(old_path, new_path, rel_label):
+    """Analyze a JS file pair using tree-sitter structural comparison.
+
+    Returns a file_report dict with declaration-level change information.
+    Falls back to text diff if tree-sitter can't handle the file.
+    """
+    old_path = Path(old_path)
+    new_path = Path(new_path)
+
+    try:
+        old_source = old_path.read_bytes()
+        new_source = new_path.read_bytes()
+    except Exception as e:
+        return _analyze_file_pair(old_path, new_path, rel_label, ".js")
+
+    old_decls, old_err_rate = _ts_fingerprint_declarations(old_source)
+    new_decls, new_err_rate = _ts_fingerprint_declarations(new_source)
+
+    # Robustness: fall back to text diff if parse quality is poor
+    if old_err_rate > 0.05 or new_err_rate > 0.05:
+        print(f"    {rel_label}: tree-sitter error rate too high "
+              f"(old={old_err_rate:.1%}, new={new_err_rate:.1%}), falling back to text diff")
+        return _analyze_file_pair(old_path, new_path, rel_label, ".js")
+
+    # Robustness: fall back if too few declarations (e.g., giant IIFE wrapper)
+    if len(old_decls) < 10 and len(new_decls) < 10:
+        print(f"    {rel_label}: too few declarations "
+              f"(old={len(old_decls)}, new={len(new_decls)}), falling back to text diff")
+        return _analyze_file_pair(old_path, new_path, rel_label, ".js")
+
+    match_result = _ts_match_declarations(old_decls, new_decls)
+
+    # Also extract strings for context (reuse existing function)
+    old_text = old_source.decode("utf-8", errors="replace")
+    new_text = new_source.decode("utf-8", errors="replace")
+    old_strings = extract_strings(old_text)
+    new_strings = extract_strings(new_text)
+
+    # Build text previews for added/removed declarations (cap at 2KB each)
+    def _decl_preview(decl, source):
+        raw = source[decl["byte_range"][0]:decl["byte_range"][1]]
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+        if len(text) > 2048:
+            text = text[:2048] + "\n... (truncated)"
+        return text
+
+    added_previews = [
+        {"type": d["type"], "name": d.get("name"), "size": d["size"],
+         "text": _decl_preview(d, new_source)}
+        for d in match_result["added"]
+    ]
+    removed_previews = [
+        {"type": d["type"], "name": d.get("name"), "size": d["size"],
+         "text": _decl_preview(d, old_source)}
+        for d in match_result["removed"]
+    ]
+
+    print(f"    {rel_label}: {match_result['unchanged']} unchanged, "
+          f"{len(match_result['content_modified'])} content-modified, "
+          f"{len(match_result['added'])} added, {len(match_result['removed'])} removed")
+
+    return {
+        "path": str(rel_label),
+        "status": "modified",
+        "analysis_mode": "treesitter",
+        "unchanged_count": match_result["unchanged"],
+        "content_modified": match_result["content_modified"],
+        "added_declarations": added_previews,
+        "removed_declarations": removed_previews,
+        "new_strings": sorted(new_strings - old_strings),
+        "removed_strings": sorted(old_strings - new_strings),
+        "hunks": "",  # no text hunks in tree-sitter mode
+    }
+
+
+# Module-level flag for tree-sitter mode (set by main())
+_use_treesitter = False
+
+
 def analyze_changes(old_dir, new_dir, added, removed, modified, renamed):
     """Analyze modified and renamed files for string changes and code hunks."""
     old_dir = Path(old_dir)
@@ -796,17 +884,26 @@ def analyze_changes(old_dir, new_dir, added, removed, modified, renamed):
 
     # Same-name modified files
     for rel in sorted(modified):
-        report = _analyze_file_pair(
-            old_dir / rel, new_dir / rel, rel, rel.suffix)
+        if _use_treesitter and rel.suffix == ".js":
+            report = _ts_analyze_file(old_dir / rel, new_dir / rel, rel)
+        else:
+            report = _analyze_file_pair(
+                old_dir / rel, new_dir / rel, rel, rel.suffix)
         file_reports.append(report)
 
     # Renamed (hash-busted) files — treat as modified
     for old_rel, new_rel in sorted(renamed, key=lambda p: str(p[1])):
-        report = _analyze_file_pair(
-            old_dir / old_rel, new_dir / new_rel,
-            f"{new_rel} (was {old_rel.name})", new_rel.suffix)
-        report["status"] = "renamed"
-        report["old_path"] = str(old_rel)
+        if _use_treesitter and new_rel.suffix == ".js":
+            report = _ts_analyze_file(old_dir / old_rel, new_dir / new_rel,
+                                       f"{new_rel} (was {old_rel.name})")
+            report["status"] = "renamed"
+            report["old_path"] = str(old_rel)
+        else:
+            report = _analyze_file_pair(
+                old_dir / old_rel, new_dir / new_rel,
+                f"{new_rel} (was {old_rel.name})", new_rel.suffix)
+            report["status"] = "renamed"
+            report["old_path"] = str(old_rel)
         file_reports.append(report)
 
     return file_reports
@@ -1543,6 +1640,156 @@ def preprocess_hunk(hunk_dict, string_changes):
 
 
 # Rate limit retry settings
+# --- Tree-sitter structural analysis functions ---
+
+def _ts_structural_hash(node):
+    """Recursively hash AST node types, ignoring leaf text (identifiers, literals).
+
+    Two declarations that differ only in minified variable names will
+    produce identical structural hashes.
+    """
+    if node.child_count == 0:
+        return hashlib.sha256(node.type.encode()).digest()
+    h = hashlib.sha256(node.type.encode())
+    for child in node.children:
+        h.update(_ts_structural_hash(child))
+    return h.digest()
+
+
+def _ts_get_decl_name(node, source):
+    """Extract the identifier name from a top-level declaration node."""
+    if node.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
+        for child in node.children:
+            if child.type in ("identifier", "property_identifier"):
+                return source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+    elif node.type in ("variable_declaration", "lexical_declaration"):
+        for child in node.children:
+            if child.type == "variable_declarator":
+                name_node = child.child_by_field_name("name")
+                if name_node:
+                    return source[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace")
+    return None
+
+
+def _ts_extract_string_literals(node, source):
+    """Extract string literal values from a node subtree (for content verification)."""
+    strings = set()
+    if node.type == "string" and node.child_count > 0:
+        text = source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+        if len(text) > 5:
+            strings.add(text)
+    for child in node.children:
+        strings.update(_ts_extract_string_literals(child, source))
+    return strings
+
+
+def _ts_fingerprint_declarations(source_bytes):
+    """Parse a JS file and fingerprint each top-level declaration.
+
+    Returns list of dicts:
+        [{index, type, name, struct_hash, content_hash, size, byte_range, strings}]
+    """
+    tree = _ts_parser.parse(source_bytes)
+    root = tree.root_node
+
+    # Check for excessive parse errors
+    error_count = sum(1 for child in root.children if child.type == "ERROR")
+    error_rate = error_count / max(root.child_count, 1)
+
+    decls = []
+    for i, node in enumerate(root.children):
+        s_hash = _ts_structural_hash(node).hex()[:16]
+        c_hash = hashlib.sha256(source_bytes[node.start_byte:node.end_byte]).hexdigest()[:16]
+        name = _ts_get_decl_name(node, source_bytes)
+        strings = _ts_extract_string_literals(node, source_bytes)
+        decls.append({
+            "index": i,
+            "type": node.type,
+            "name": name,
+            "struct_hash": s_hash,
+            "content_hash": c_hash,
+            "size": node.end_byte - node.start_byte,
+            "byte_range": (node.start_byte, node.end_byte),
+            "strings": strings,
+        })
+
+    return decls, error_rate
+
+
+def _ts_match_declarations(old_decls, new_decls):
+    """Match declarations between two versions using structural hashes.
+
+    Returns dict with:
+        unchanged: count of structurally identical declarations (skip)
+        content_modified: list of struct_hashes where structure matches but strings differ
+        added: list of new declarations with no structural match
+        removed: list of old declarations with no structural match
+    """
+    from collections import defaultdict
+
+    # Group by structural hash
+    old_by_struct = defaultdict(list)
+    for d in old_decls:
+        old_by_struct[d["struct_hash"]].append(d)
+
+    new_by_struct = defaultdict(list)
+    for d in new_decls:
+        new_by_struct[d["struct_hash"]].append(d)
+
+    unchanged_count = 0
+    content_modified = []  # struct_hashes where strings differ
+    added = []
+    removed = []
+
+    shared_hashes = old_by_struct.keys() & new_by_struct.keys()
+    only_old_hashes = old_by_struct.keys() - new_by_struct.keys()
+    only_new_hashes = new_by_struct.keys() - old_by_struct.keys()
+
+    # Process shared structural hashes
+    for sh in shared_hashes:
+        old_group = old_by_struct[sh]
+        new_group = new_by_struct[sh]
+        matched = min(len(old_group), len(new_group))
+
+        # Check if string content differs across the group
+        old_strings = set()
+        for d in old_group:
+            old_strings.update(d["strings"])
+        new_strings = set()
+        for d in new_group:
+            new_strings.update(d["strings"])
+
+        if old_strings != new_strings and (old_strings or new_strings):
+            content_modified.append({
+                "struct_hash": sh,
+                "count": matched,
+                "old_strings": old_strings - new_strings,
+                "new_strings": new_strings - old_strings,
+                "type": old_group[0]["type"],
+            })
+        else:
+            unchanged_count += matched
+
+        # Handle count differences
+        if len(new_group) > len(old_group):
+            added.extend(new_group[len(old_group):])
+        elif len(old_group) > len(new_group):
+            removed.extend(old_group[len(new_group):])
+
+    # Declarations with no structural match
+    for sh in only_new_hashes:
+        added.extend(new_by_struct[sh])
+    for sh in only_old_hashes:
+        removed.extend(old_by_struct[sh])
+
+    return {
+        "unchanged": unchanged_count,
+        "content_modified": content_modified,
+        "added": added,
+        "removed": removed,
+    }
+
+
 RATE_LIMIT_MAX_RETRIES = 3
 RATE_LIMIT_BASE_WAIT = 60  # seconds
 
@@ -2614,6 +2861,8 @@ def main():
                         help="Use Anthropic Batch API (default in CI, 50%% cheaper)")
     parser.add_argument("--legacy-cli", action="store_true",
                         help="Use claude CLI subprocess instead of SDK")
+    parser.add_argument("--no-treesitter", action="store_true",
+                        help="Disable tree-sitter structural analysis, use text diff instead")
     args = parser.parse_args()
 
     # Auto-detect worker count (OOM is fixed, 4 workers is safe)
@@ -2644,14 +2893,16 @@ def main():
         args.batch = True
 
     # Set module-level mode flags
-    global _use_sdk, _use_batch
+    global _use_sdk, _use_batch, _use_treesitter
     _use_sdk = not args.legacy_cli
     _use_batch = args.batch
+    _use_treesitter = HAS_TREESITTER and not args.no_treesitter
     if _use_sdk:
         mode_desc = "Batch API" if _use_batch else "SDK (sync)"
     else:
         mode_desc = "CLI (legacy)"
-    print(f"  Analysis mode: {mode_desc}")
+    ts_desc = "tree-sitter" if _use_treesitter else "text diff"
+    print(f"  Analysis mode: {mode_desc} | Diff mode: {ts_desc}")
 
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -2718,10 +2969,13 @@ def main():
     _log_memory("After new source acquired")
 
     # Step 5: Beautify JS
-    print("\n=== Step 5: Beautifying JS ===")
-    beautify_js(old_app)
-    beautify_js(new_app)
-    _log_memory("After step 5 (beautify JS)")
+    if _use_treesitter:
+        print("\n=== Step 5: Skipped (tree-sitter handles minified JS directly) ===")
+    else:
+        print("\n=== Step 5: Beautifying JS ===")
+        beautify_js(old_app)
+        beautify_js(new_app)
+    _log_memory("After step 5")
 
     # Step 6: Compare and analyze
     print("\n=== Step 6: Comparing files ===")
