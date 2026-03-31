@@ -2242,6 +2242,10 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
 
 
 def main():
+    # Force unbuffered stdout so progress lines appear before any SIGTERM
+    sys.stdout.reconfigure(line_buffering=True)
+    print("[compare-releases] Starting up...")
+    _log_memory("startup")
     parser = argparse.ArgumentParser(
         description="Compare two claude-desktop-debian releases to identify functional changes."
     )
