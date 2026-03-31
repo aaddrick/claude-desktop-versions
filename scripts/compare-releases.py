@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,20 @@ from pathlib import Path
 
 
 REPO = "aaddrick/claude-desktop-debian"
+
+
+def _log_memory(label):
+    """Log peak RSS for both the Python process and its waited-for children."""
+    self_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    child_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    # On Linux, ru_maxrss is in KB; on macOS, it's in bytes
+    if sys.platform == "darwin":
+        self_mb = self_rss / (1024 * 1024)
+        child_mb = child_rss / (1024 * 1024)
+    else:
+        self_mb = self_rss / 1024
+        child_mb = child_rss / 1024
+    print(f"  [Memory] {label}: self={self_mb:.1f} MB, children_peak={child_mb:.1f} MB")
 
 
 class TokenTracker:
@@ -405,6 +420,15 @@ def beautify_js(source_dir):
         print(f"  No JS files found to beautify.")
         return
 
+    # Log file inventory for memory profiling
+    file_sizes = [f.stat().st_size for f in js_files]
+    total_size = sum(file_sizes)
+    largest_size = max(file_sizes)
+    largest_file = js_files[file_sizes.index(largest_size)]
+    print(f"  JS file inventory: {len(js_files)} files, "
+          f"total={total_size / (1024 * 1024):.1f} MB, "
+          f"largest={largest_file.name} ({largest_size / (1024 * 1024):.1f} MB)")
+
     # Check if already beautified by sampling the largest JS file (most likely minified)
     sample = max(js_files, key=lambda f: f.stat().st_size)
     with open(sample, "r", errors="replace") as f:
@@ -430,7 +454,7 @@ def beautify_js(source_dir):
                 try:
                     run(["npx", "prettier", "--write", "--parser", "babel", str(f)])
                 except RuntimeError:
-                    pass  # Skip files that can't be parsed
+                    print(f"  Warning: prettier failed on {f.name} ({f.stat().st_size} bytes)")
 
 
 def file_hash(path):
@@ -1918,7 +1942,7 @@ Write in markdown format."""
         return f"# Summary Generation Failed\n\nUnexpected error: {e}"
 
 
-def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="opus", voice_profile=None):
+def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="opus", voice_profile=None, max_workers=4):
     """Orchestrate Claude analysis of all changed hunks.
 
     Manages progress tracking, per-hunk analysis, and final summary generation.
@@ -2066,7 +2090,6 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
     completed = 0
     remaining = len(tasks_to_run)
     progress_lock = threading.Lock()
-    max_workers = 4
 
     def _run_single(task, task_idx):
         """Execute a single hunk analysis and return (task_idx, task, result)."""
@@ -2111,7 +2134,14 @@ def run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model="
 
                 progress["completed_hunks"] = already_done + completed
                 progress_path.write_text(json.dumps(progress, indent=2))
-                print(f"  [{completed}/{remaining}] hunks complete")
+                # Log memory at each hunk completion including accumulated data size
+                progress_json_size = len(json.dumps(progress)) if completed % 5 == 0 else 0
+                if progress_json_size:
+                    print(f"  [{completed}/{remaining}] hunks complete"
+                          f" | progress_json={progress_json_size / 1024:.0f} KB")
+                    _log_memory(f"Hunk {completed}/{remaining}")
+                else:
+                    print(f"  [{completed}/{remaining}] hunks complete")
 
     progress["status"] = "analysis_complete"
     progress_path.write_text(json.dumps(progress, indent=2))
@@ -2181,7 +2211,13 @@ def main():
                         help="Model for summary generation (default: opus)")
     parser.add_argument("--voice-profile-url",
                         help="URL to a voice profile .md file for styling the summary")
+    parser.add_argument("--max-workers", type=int, default=None,
+                        help="Max parallel Claude CLI workers (default: 1 in CI, 4 locally)")
     args = parser.parse_args()
+
+    # Auto-detect CI for worker count default
+    if args.max_workers is None:
+        args.max_workers = 1 if os.environ.get("CI") else 4
 
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -2214,21 +2250,29 @@ def main():
         print(f"  Using local AppImage: {new_appimage}")
     else:
         new_appimage = download_appimage(new_tag, new_work)
+    _log_memory("After step 2 (download)")
 
-    # Step 3: Extract AppImages
-    print("\n=== Step 3: Extracting AppImages ===")
+    # Step 3+4: Extract AppImages then app.asar, cleaning up squashfs-root after each
+    print("\n=== Step 3: Extracting AppImages + app.asar ===")
     old_squashfs = extract_appimage(old_appimage, old_work)
-    new_squashfs = extract_appimage(new_appimage, new_work)
-
-    # Step 4: Extract app.asar
-    print("\n=== Step 4: Extracting app.asar ===")
     old_app = extract_asar(old_squashfs, old_app)
+    if not args.keep:
+        print(f"  Removing {old_squashfs} to free disk")
+        shutil.rmtree(old_squashfs)
+    _log_memory("After old extract + asar")
+
+    new_squashfs = extract_appimage(new_appimage, new_work)
     new_app = extract_asar(new_squashfs, new_app)
+    if not args.keep:
+        print(f"  Removing {new_squashfs} to free disk")
+        shutil.rmtree(new_squashfs)
+    _log_memory("After new extract + asar")
 
     # Step 5: Beautify JS
     print("\n=== Step 5: Beautifying JS ===")
     beautify_js(old_app)
     beautify_js(new_app)
+    _log_memory("After step 5 (beautify JS)")
 
     # Step 6: Compare and analyze
     print("\n=== Step 6: Comparing files ===")
@@ -2243,6 +2287,7 @@ def main():
 
     print("\n=== Step 6b: Analyzing changes ===")
     file_reports = analyze_changes(old_app, new_app, added, removed, modified, renamed)
+    _log_memory("After step 6 (compare + analyze)")
 
     # Step 7: Generate reports
     print("\n=== Step 7: Generating reports ===")
@@ -2258,12 +2303,14 @@ def main():
     print(f"\n  Reports written to:")
     print(f"    {md_path}")
     print(f"    {json_path}")
+    _log_memory("After step 7 (generate reports)")
 
     # Step 8: Claude-powered analysis
     if not args.no_analyze:
         if get_has_claude():
             print("\n=== Step 8: Claude-powered analysis ===")
-            run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model=args.model, voice_profile=voice_profile)
+            run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model=args.model, voice_profile=voice_profile, max_workers=args.max_workers)
+            _log_memory("After step 8 (Claude analysis)")
         else:
             print("\n=== Step 8: Skipped (claude CLI not found) ===")
             print("  Install the claude CLI to enable AI-powered change analysis.")
