@@ -29,6 +29,33 @@ from pathlib import Path
 
 REPO = "aaddrick/claude-desktop-debian"
 
+# Anthropic SDK (optional — falls back to claude CLI if unavailable)
+try:
+    import anthropic
+    HAS_SDK = True
+except ImportError:
+    HAS_SDK = False
+
+# Model pricing for cost calculation (USD per million tokens)
+# SDK doesn't provide costUSD like CLI does, so we compute it
+MODEL_PRICING = {
+    # Standard pricing
+    "claude-opus-4-6": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75, "batch_discount": 0.5},
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75, "batch_discount": 0.5},
+    "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25, "batch_discount": 0.5},
+    # Aliases used in CLI (short names map to latest)
+    "opus": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75, "batch_discount": 0.5},
+    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75, "batch_discount": 0.5},
+    "haiku": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25, "batch_discount": 0.5},
+}
+
+# Map short model names to full SDK model IDs
+MODEL_ID_MAP = {
+    "opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+}
+
 
 def _log_memory(label):
     """Log peak RSS for both the Python process and its waited-for children."""
@@ -1559,6 +1586,9 @@ def _cli_log(workdir, msg):
 
 # Module-level workdir reference for logging (set by run_claude_analysis)
 _cli_log_workdir = None
+# Module-level flag for SDK vs CLI mode (set by main() based on args)
+_use_sdk = False
+_use_batch = False
 
 
 def _run_claude_cli(cmd, input_text, timeout_secs):
@@ -1656,7 +1686,253 @@ def _extract_structured_output(response_json):
     return response_json
 
 
-# JSON schema for per-hunk Claude analysis
+# --- Anthropic SDK call functions ---
+
+# JSON schema for per-hunk analysis (used by both CLI and SDK paths)
+HUNK_ANALYSIS_TOOL = {
+    "name": "analysis",
+    "description": "Structured analysis of code changes",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "description": {
+                "type": "string",
+                "description": "What the code in this hunk does, including the purpose of key functions and logic"
+            },
+            "change_summary": {
+                "type": "string",
+                "description": "What functionally changed (not just what's different — the semantic delta)"
+            },
+            "key_identifiers": {
+                "type": "object",
+                "description": "Map of minified identifier names to guessed meaningful names, e.g. {\"e\": \"event\", \"t\": \"timeout\"}",
+                "additionalProperties": {"type": "string"}
+            }
+        },
+        "required": ["description", "change_summary", "key_identifiers"]
+    }
+}
+
+
+def _resolve_model_id(model_name):
+    """Resolve short model names (opus, sonnet, haiku) to full SDK model IDs."""
+    return MODEL_ID_MAP.get(model_name, model_name)
+
+
+def _compute_cost(model_id, usage, is_batch=False):
+    """Compute cost in USD from token counts and model pricing."""
+    pricing = MODEL_PRICING.get(model_id)
+    if not pricing:
+        # Try without version suffix
+        for key, val in MODEL_PRICING.items():
+            if key in model_id:
+                pricing = val
+                break
+    if not pricing:
+        return 0.0
+
+    discount = pricing.get("batch_discount", 1.0) if is_batch else 1.0
+    cost = (
+        usage.input_tokens * pricing["input"] / 1_000_000 * discount
+        + usage.output_tokens * pricing["output"] / 1_000_000 * discount
+        + getattr(usage, "cache_read_input_tokens", 0) * pricing["cache_read"] / 1_000_000 * discount
+        + getattr(usage, "cache_creation_input_tokens", 0) * pricing["cache_write"] / 1_000_000 * discount
+    )
+    return cost
+
+
+def _api_call(prompt, model="sonnet", tool=None, timeout_secs=1200, is_batch=False):
+    """Make a single Anthropic SDK call.
+
+    Args:
+        prompt: The user message text
+        model: Model name (short or full ID)
+        tool: Optional tool dict for structured output (forces tool_choice)
+        timeout_secs: Request timeout in seconds
+        is_batch: Whether this call is part of a batch (affects cost calculation)
+
+    Returns:
+        dict with keys: "result" (parsed output), "usage" (token counts), "error" (if failed)
+    """
+    model_id = _resolve_model_id(model)
+    client = anthropic.Anthropic(
+        max_retries=3,
+        timeout=timeout_secs,
+    )
+
+    kwargs = {
+        "model": model_id,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if tool:
+        kwargs["tools"] = [tool]
+        kwargs["tool_choice"] = {"type": "tool", "name": tool["name"]}
+
+    t0 = time.time()
+    try:
+        response = client.messages.create(**kwargs)
+    except anthropic.APITimeoutError:
+        elapsed = time.time() - t0
+        _cli_log(_cli_log_workdir, f"TIMEOUT model={model_id} elapsed={elapsed:.1f}s")
+        return {"result": None, "error": "API timeout", "usage": None}
+    except anthropic.APIError as e:
+        elapsed = time.time() - t0
+        _cli_log(_cli_log_workdir, f"API_ERROR model={model_id} elapsed={elapsed:.1f}s error={e}")
+        return {"result": None, "error": f"API error: {e}", "usage": None}
+
+    elapsed = time.time() - t0
+
+    # Record token usage
+    if response.usage:
+        cost = _compute_cost(model_id, response.usage, is_batch=is_batch)
+        with token_tracker._lock:
+            if model_id not in token_tracker._usage:
+                token_tracker._usage[model_id] = {
+                    "inputTokens": 0, "outputTokens": 0,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                    "costUSD": 0.0, "calls": 0,
+                }
+            entry = token_tracker._usage[model_id]
+            entry["inputTokens"] += response.usage.input_tokens
+            entry["outputTokens"] += response.usage.output_tokens
+            entry["cacheReadInputTokens"] += getattr(response.usage, "cache_read_input_tokens", 0)
+            entry["cacheCreationInputTokens"] += getattr(response.usage, "cache_creation_input_tokens", 0)
+            entry["costUSD"] += cost
+            entry["calls"] += 1
+
+    _cli_log(_cli_log_workdir,
+             f"OK model={model_id} elapsed={elapsed:.1f}s "
+             f"input={response.usage.input_tokens} output={response.usage.output_tokens}")
+
+    # Extract result
+    if tool:
+        # Structured output — find the tool_use block
+        tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+        if tool_block:
+            return {"result": tool_block.input, "error": None, "usage": response.usage}
+        return {"result": None, "error": "No tool_use block in response", "usage": response.usage}
+    else:
+        # Free-form text output
+        text_block = next((b for b in response.content if b.type == "text"), None)
+        if text_block:
+            return {"result": text_block.text, "error": None, "usage": response.usage}
+        return {"result": None, "error": "No text block in response", "usage": response.usage}
+
+
+def _api_build_request(custom_id, prompt, model="sonnet", tool=None):
+    """Build a single request dict for the Batch API.
+
+    Returns a dict suitable for client.messages.batches.create(requests=[...]).
+    """
+    model_id = _resolve_model_id(model)
+    params = {
+        "model": model_id,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if tool:
+        params["tools"] = [tool]
+        params["tool_choice"] = {"type": "tool", "name": tool["name"]}
+
+    return {"custom_id": custom_id, "params": params}
+
+
+def _batch_submit_and_poll(requests, workdir, progress_data=None):
+    """Submit a Message Batch, poll for completion, return results.
+
+    Args:
+        requests: List of request dicts from _api_build_request()
+        workdir: Working directory for progress file
+        progress_data: Optional existing progress dict to update
+
+    Returns:
+        dict mapping custom_id -> result dict
+    """
+    client = anthropic.Anthropic()
+    progress_path = Path(workdir) / "analysis-progress.json"
+
+    # Submit batch
+    print(f"  Submitting batch of {len(requests)} requests...")
+    batch = client.messages.batches.create(requests=requests)
+    print(f"  Batch ID: {batch.id}")
+
+    # Persist batch_id for resumability
+    if progress_data is not None:
+        progress_data["batch_id"] = batch.id
+        progress_data["batch_status"] = "submitted"
+        progress_path.write_text(json.dumps(progress_data, indent=2))
+
+    # Poll for completion
+    while True:
+        status = client.messages.batches.retrieve(batch.id)
+        counts = status.request_counts
+        done = counts.succeeded + counts.errored + counts.expired + counts.canceled
+        total = done + counts.processing
+        print(f"  Batch {batch.id}: {done}/{total} complete "
+              f"({counts.succeeded} ok, {counts.errored} errors, {counts.expired} expired)")
+
+        if status.processing_status == "ended":
+            break
+        if status.processing_status in ("canceling",):
+            print(f"  Batch is canceling, waiting...")
+        time.sleep(30)
+
+    # Collect results
+    results = {}
+    errors = 0
+    for result in client.messages.batches.results(batch.id):
+        cid = result.custom_id
+        if result.result.type == "succeeded":
+            msg = result.result.message
+            # Record token usage
+            if msg.usage:
+                cost = _compute_cost(msg.model, msg.usage, is_batch=True)
+                with token_tracker._lock:
+                    model_id = msg.model
+                    if model_id not in token_tracker._usage:
+                        token_tracker._usage[model_id] = {
+                            "inputTokens": 0, "outputTokens": 0,
+                            "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+                            "costUSD": 0.0, "calls": 0,
+                        }
+                    entry = token_tracker._usage[model_id]
+                    entry["inputTokens"] += msg.usage.input_tokens
+                    entry["outputTokens"] += msg.usage.output_tokens
+                    entry["cacheReadInputTokens"] += getattr(msg.usage, "cache_read_input_tokens", 0)
+                    entry["cacheCreationInputTokens"] += getattr(msg.usage, "cache_creation_input_tokens", 0)
+                    entry["costUSD"] += cost
+                    entry["calls"] += 1
+
+            # Extract structured or text result
+            tool_block = next((b for b in msg.content if b.type == "tool_use"), None)
+            if tool_block:
+                results[cid] = {"result": tool_block.input, "error": None}
+            else:
+                text_block = next((b for b in msg.content if b.type == "text"), None)
+                results[cid] = {"result": text_block.text if text_block else None, "error": None}
+        elif result.result.type == "errored":
+            results[cid] = {"result": None, "error": f"Batch error: {result.result.error}"}
+            errors += 1
+        elif result.result.type == "expired":
+            results[cid] = {"result": None, "error": "Request expired (24h batch limit)"}
+            errors += 1
+        else:
+            results[cid] = {"result": None, "error": f"Unknown status: {result.result.type}"}
+            errors += 1
+
+    if errors:
+        print(f"  Batch completed with {errors} errors out of {len(requests)} requests")
+
+    # Update progress
+    if progress_data is not None:
+        progress_data["batch_status"] = "completed"
+        progress_path.write_text(json.dumps(progress_data, indent=2))
+
+    return results
+
+
+# JSON schema for per-hunk Claude analysis (CLI format — kept for --legacy-cli)
 HUNK_ANALYSIS_SCHEMA = json.dumps({
     "type": "object",
     "properties": {
@@ -1772,6 +2048,18 @@ Return your analysis as JSON."""
     _cli_log(_cli_log_workdir,
              f"HUNK_SINGLE file={file_path} tier={tier} "
              f"hunk_chars={len(hunk_content)} prompt_chars={len(prompt)}")
+
+    # SDK path
+    if _use_sdk:
+        try:
+            resp = _api_call(prompt, model=model, tool=HUNK_ANALYSIS_TOOL, timeout_secs=1200)
+            if resp["error"]:
+                return {"error": resp["error"], **error_stub}
+            return resp["result"]
+        except Exception as e:
+            return {"error": f"SDK error: {e}", **error_stub}
+
+    # Legacy CLI path
     try:
         result = _run_claude_cli(
             ["claude", "-p", "--model", model,
@@ -1832,6 +2120,17 @@ def _summarize_file_with_claude(file_path, hunks, old_tag, new_tag, model):
 Write a concise summary (1-5 bullet points) of the substantive changes in this file.
 Focus on functional/behavioral changes, not minified name shuffles. Omit hunks that failed."""
 
+    # SDK path
+    if _use_sdk:
+        try:
+            resp = _api_call(prompt, model=model, timeout_secs=180)
+            if resp["error"]:
+                return f"- {file_path}: summary failed ({resp['error']})"
+            return resp["result"]
+        except Exception as e:
+            return f"- {file_path}: summary error ({e})"
+
+    # Legacy CLI path
     try:
         result = _run_claude_cli(
             ["claude", "-p", "--model", model, "--output-format", "json",
@@ -2005,6 +2304,17 @@ Do NOT include a confidence assessment table. If you're unsure about something, 
 {voice_section}
 Write in markdown format."""
 
+    # SDK path
+    if _use_sdk:
+        try:
+            resp = _api_call(prompt, model=model, timeout_secs=300)
+            if resp["error"]:
+                return f"# Summary Generation Failed\n\nSDK error: {resp['error']}"
+            return resp["result"]
+        except Exception as e:
+            return f"# Summary Generation Failed\n\nUnexpected error: {e}"
+
+    # Legacy CLI path
     try:
         result = _run_claude_cli(
             ["claude", "-p", "--model", model, "--output-format", "json",
@@ -2299,12 +2609,49 @@ def main():
     parser.add_argument("--voice-profile-url",
                         help="URL to a voice profile .md file for styling the summary")
     parser.add_argument("--max-workers", type=int, default=None,
-                        help="Max parallel Claude CLI workers (default: 1 in CI, 4 locally)")
+                        help="Max parallel workers (default: 4)")
+    parser.add_argument("--batch", action="store_true",
+                        help="Use Anthropic Batch API (default in CI, 50%% cheaper)")
+    parser.add_argument("--legacy-cli", action="store_true",
+                        help="Use claude CLI subprocess instead of SDK")
     args = parser.parse_args()
 
-    # Auto-detect CI for worker count default
+    # Auto-detect worker count (OOM is fixed, 4 workers is safe)
     if args.max_workers is None:
-        args.max_workers = 1 if os.environ.get("CI") else 4
+        args.max_workers = 4
+
+    # Auto-detect analysis mode
+    if not args.legacy_cli and not HAS_SDK:
+        if get_has_claude():
+            print("  Note: anthropic SDK not installed, using claude CLI (install with: pip install anthropic)")
+            args.legacy_cli = True
+        else:
+            print("Error: Neither ANTHROPIC_API_KEY (for SDK) nor claude CLI found.", file=sys.stderr)
+            print("  Install SDK: pip install anthropic && export ANTHROPIC_API_KEY=...", file=sys.stderr)
+            print("  Or install CLI: npm install -g @anthropic-ai/claude-code", file=sys.stderr)
+            sys.exit(1)
+
+    if not args.legacy_cli and HAS_SDK and not os.environ.get("ANTHROPIC_API_KEY"):
+        if get_has_claude():
+            print("  Note: ANTHROPIC_API_KEY not set, falling back to claude CLI")
+            args.legacy_cli = True
+        else:
+            print("Error: ANTHROPIC_API_KEY environment variable required for SDK mode.", file=sys.stderr)
+            sys.exit(1)
+
+    # Default to batch mode in CI
+    if not args.legacy_cli and not args.batch and os.environ.get("CI"):
+        args.batch = True
+
+    # Set module-level mode flags
+    global _use_sdk, _use_batch
+    _use_sdk = not args.legacy_cli
+    _use_batch = args.batch
+    if _use_sdk:
+        mode_desc = "Batch API" if _use_batch else "SDK (sync)"
+    else:
+        mode_desc = "CLI (legacy)"
+    print(f"  Analysis mode: {mode_desc}")
 
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -2409,13 +2756,14 @@ def main():
 
     # Step 8: Claude-powered analysis
     if not args.no_analyze:
-        if get_has_claude():
+        can_analyze = _use_sdk or get_has_claude()
+        if can_analyze:
             print("\n=== Step 8: Claude-powered analysis ===")
             run_claude_analysis(file_reports, workdir, old_tag, new_tag, summary_model=args.model, voice_profile=voice_profile, max_workers=args.max_workers)
             _log_memory("After step 8 (Claude analysis)")
         else:
-            print("\n=== Step 8: Skipped (claude CLI not found) ===")
-            print("  Install the claude CLI to enable AI-powered change analysis.")
+            print("\n=== Step 8: Skipped (no SDK or CLI available) ===")
+            print("  Install anthropic SDK or claude CLI to enable AI-powered change analysis.")
     else:
         print("\n=== Step 8: Skipped (--no-analyze) ===")
 
