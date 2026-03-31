@@ -16,6 +16,7 @@ import os
 import re
 import resource
 import shutil
+import tarfile
 import subprocess
 import sys
 import tempfile
@@ -319,6 +320,53 @@ def resolve_releases(old_tag, new_tag):
 
     print("Error: All recent releases have the same Claude version.", file=sys.stderr)
     sys.exit(1)
+
+
+def download_reference_source(tag, dest_dir):
+    """Download and extract reference-source.tar.gz for a given release tag.
+
+    Returns the path to the extracted app directory, or None if the tarball
+    is not available for this release.
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if this release has a reference-source.tar.gz asset
+    output = run(["gh", "release", "view", tag, "--json", "assets", "-R", REPO])
+    assets = json.loads(output).get("assets", [])
+    tarball_name = None
+    for a in assets:
+        if a.get("name", "") == "reference-source.tar.gz":
+            tarball_name = "reference-source.tar.gz"
+            break
+
+    if not tarball_name:
+        return None
+
+    tarball_path = dest_dir / tarball_name
+    if not tarball_path.exists():
+        print(f"  Downloading {tarball_name}...")
+        run(["gh", "release", "download", tag,
+             "--pattern", tarball_name,
+             "--dir", str(dest_dir),
+             "-R", REPO])
+    else:
+        print(f"  {tarball_name} already downloaded.")
+
+    # Extract tarball — contains app-extracted/ directory
+    app_dir = dest_dir / "app-extracted"
+    if app_dir.exists() and any(app_dir.iterdir()):
+        print(f"  Reference source already extracted, skipping.")
+        return app_dir
+
+    print(f"  Extracting reference source...")
+    with tarfile.open(tarball_path, "r:gz") as tf:
+        tf.extractall(path=str(dest_dir), filter="data")
+
+    if not app_dir.exists():
+        raise RuntimeError(f"Expected app-extracted/ in tarball, not found in {dest_dir}")
+
+    return app_dir
 
 
 def download_appimage(tag, dest_dir):
@@ -2240,33 +2288,48 @@ def main():
     old_work.mkdir(parents=True, exist_ok=True)
     new_work.mkdir(parents=True, exist_ok=True)
 
-    # Step 2: Download AppImages
-    print("\n=== Step 2: Downloading AppImages ===")
-    old_appimage = download_appimage(old_tag, old_work)
+    # Step 2: Get app source (prefer reference-source tarball, fall back to AppImage)
+    print("\n=== Step 2: Acquiring app source ===")
+
+    # Try reference-source.tar.gz first (lightweight, avoids AppImage OOM on CI)
+    old_ref = download_reference_source(old_tag, old_work)
+    if old_ref:
+        old_app = old_ref
+        print(f"  Old: using reference source tarball")
     if args.new_appimage:
-        new_appimage = Path(args.new_appimage).resolve()
-        if not new_appimage.exists():
-            raise FileNotFoundError(f"Local AppImage not found: {new_appimage}")
-        print(f"  Using local AppImage: {new_appimage}")
+        new_ref = None  # Local AppImage explicitly provided, skip tarball
     else:
-        new_appimage = download_appimage(new_tag, new_work)
-    _log_memory("After step 2 (download)")
+        new_ref = download_reference_source(new_tag, new_work)
+    if new_ref:
+        new_app = new_ref
+        print(f"  New: using reference source tarball")
 
-    # Step 3+4: Extract AppImages then app.asar, cleaning up squashfs-root after each
-    print("\n=== Step 3: Extracting AppImages + app.asar ===")
-    old_squashfs = extract_appimage(old_appimage, old_work)
-    old_app = extract_asar(old_squashfs, old_app)
-    if not args.keep:
-        print(f"  Removing {old_squashfs} to free disk")
-        shutil.rmtree(old_squashfs)
-    _log_memory("After old extract + asar")
+    # Fall back to AppImage extraction for releases without tarballs
+    if not old_ref:
+        print(f"  Old: no reference source, falling back to AppImage")
+        old_appimage = download_appimage(old_tag, old_work)
+        old_squashfs = extract_appimage(old_appimage, old_work)
+        old_app = extract_asar(old_squashfs, old_app)
+        if not args.keep:
+            print(f"  Removing {old_squashfs} to free disk")
+            shutil.rmtree(old_squashfs)
+    _log_memory("After old source acquired")
 
-    new_squashfs = extract_appimage(new_appimage, new_work)
-    new_app = extract_asar(new_squashfs, new_app)
-    if not args.keep:
-        print(f"  Removing {new_squashfs} to free disk")
-        shutil.rmtree(new_squashfs)
-    _log_memory("After new extract + asar")
+    if not new_ref:
+        if args.new_appimage:
+            new_appimage = Path(args.new_appimage).resolve()
+            if not new_appimage.exists():
+                raise FileNotFoundError(f"Local AppImage not found: {new_appimage}")
+            print(f"  New: using local AppImage: {new_appimage}")
+        else:
+            print(f"  New: no reference source, falling back to AppImage")
+            new_appimage = download_appimage(new_tag, new_work)
+        new_squashfs = extract_appimage(new_appimage, new_work)
+        new_app = extract_asar(new_squashfs, new_app)
+        if not args.keep:
+            print(f"  Removing {new_squashfs} to free disk")
+            shutil.rmtree(new_squashfs)
+    _log_memory("After new source acquired")
 
     # Step 5: Beautify JS
     print("\n=== Step 5: Beautifying JS ===")
